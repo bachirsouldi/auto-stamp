@@ -1,4 +1,4 @@
-# index.py
+# index.py — Advanced PDF Watermark Tool with Tiled Text Mode + Multi-Stamp Manager
 import io
 import tempfile
 from dataclasses import dataclass, asdict
@@ -66,9 +66,16 @@ class Stamp:
     rect_opacity: float = 0.0   # 0 solid, 1 fully transparent
     border_width_pt: float = 1.0
     padding_mm: float = 3.0
+    # tiled watermark (TEXT ONLY)
+    tiled: bool = False            # repeat text across page
+    tile_dx_mm: float = 60.0       # spacing X (mm)
+    tile_dy_mm: float = 60.0       # spacing Y (mm)
+    tile_angle_deg: float = 45.0   # override rotation for tiled mode
 
 if "stamps" not in st.session_state:
     st.session_state.stamps: List[Stamp] = []
+if "selected_stamp_index" not in st.session_state:
+    st.session_state.selected_stamp_index = None  # set when first stamp is added
 if "preview_page_index" not in st.session_state:
     st.session_state.preview_page_index = 0  # 0-based
 if "pdf_bytes" not in st.session_state:
@@ -119,43 +126,60 @@ with st.sidebar:
     n_opacity = 0.0
     n_bw = 1.0
     n_pad = 3.0
+    # tiled defaults for TEXT ONLY
+    n_tiled = False
+    n_tile_dx_mm = 60.0
+    n_tile_dy_mm = 60.0
+    n_tile_angle = 45.0
 
     if new_type == "image":
         up = st.file_uploader("Image (PNG/JPG)", type=["png", "jpg", "jpeg"], key="new_img")
         if up: n_img = up.read()
     else:
-        n_text = st.text_input("Text", value="APPROVED")
+        n_text = st.text_input("Text", value="CONFIDENTIAL")
         c1, c2, c3 = st.columns(3)
         with c1: n_bold = st.checkbox("Bold", True)
         with c2: n_italic = st.checkbox("Italic", False)
-        with c3: n_font = st.number_input("Font size (pt)", 8, 200, 28)
+        with c3: n_font = st.number_input("Font size (pt)", 8, 200, 48)
 
         c4, c5 = st.columns(2)
         with c4:
             n_fill = st.color_picker("Rect fill", value="#FFFFFF")
-            n_opacity = st.slider("Rect transparency (0→1)", 0.0, 1.0, 0.0, 0.05)
+            n_opacity = st.slider("Rect transparency (0→1)", 0.0, 1.0, 0.7, 0.05)
         with c5:
             n_border = st.color_picker("Rect border", value="#000000")
-            n_bw = st.number_input("Border width (pt)", 0.0, 12.0, 1.0, 0.5)
+            n_bw = st.number_input("Border width (pt)", 0.0, 12.0, 0.0, 0.5)  # default 0 for cleaner watermark
 
         n_text_col = st.color_picker("Text color", value="#000000")
         n_pad = st.number_input("Padding (mm)", 0.0, 50.0, 3.0, 0.5)
+
+        with st.expander("Tiled watermark (text only)"):
+            n_tiled = st.checkbox("Enable tiled mode for this new text stamp", value=True)
+            ntc1, ntc2 = st.columns(2)
+            with ntc1:
+                n_tile_dx_mm = st.number_input("Tile spacing X (mm)", 10.0, 500.0, 120.0, 1.0)
+            with ntc2:
+                n_tile_dy_mm = st.number_input("Tile spacing Y (mm)", 10.0, 500.0, 120.0, 1.0)
+            n_tile_angle = st.slider("Tile angle (°)", -180.0, 180.0, 45.0, 1.0)
 
     if st.button("➕ Add stamp"):
         if new_type == "image" and not n_img:
             st.warning("Please upload an image.")
         else:
             pf, pt = 1, max(1, num_pages) if num_pages else 1
-            st.session_state.stamps.append(
-                Stamp(
-                    stamp_type=new_type, x_mm=nx, y_mm=ny, w_mm=nw, h_mm=nh, rotation_deg=nrot,
-                    page_from=pf, page_to=pt,
-                    image_bytes=n_img,
-                    text=n_text, font_size_pt=n_font, bold=n_bold, italic=n_italic,
-                    rect_fill_hex=n_fill, rect_border_hex=n_border, text_color_hex=n_text_col,
-                    rect_opacity=n_opacity, border_width_pt=n_bw, padding_mm=n_pad
-                )
+            new_stamp = Stamp(
+                stamp_type=new_type, x_mm=nx, y_mm=ny, w_mm=nw, h_mm=nh, rotation_deg=nrot,
+                page_from=pf, page_to=pt,
+                image_bytes=n_img,
+                text=n_text, font_size_pt=n_font, bold=n_bold, italic=n_italic,
+                rect_fill_hex=n_fill, rect_border_hex=n_border, text_color_hex=n_text_col,
+                rect_opacity=n_opacity, border_width_pt=n_bw, padding_mm=n_pad,
+                tiled=(n_tiled if new_type == "text" else False),
+                tile_dx_mm=n_tile_dx_mm, tile_dy_mm=n_tile_dy_mm, tile_angle_deg=n_tile_angle
             )
+            st.session_state.stamps.append(new_stamp)
+            # default selection to newly added
+            st.session_state.selected_stamp_index = len(st.session_state.stamps) - 1
             st.success("Stamp added — edit it in the right control panel.")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -235,31 +259,72 @@ def draw_preview_overlay_for_page(
             except Exception:
                 pass
         else:
-            # Rectangle fill
-            fill_rgb = HexColor(sp.rect_fill_hex).rgb()
-            border_rgb = HexColor(sp.rect_border_hex).rgb()
-            alpha = int(round(255 * (1.0 - sp.rect_opacity)))
-
-            # Fill first
-            draw.rectangle(
-                [l, t, r, b],
-                fill=(int(fill_rgb[0]*255), int(fill_rgb[1]*255), int(fill_rgb[2]*255), alpha)
-            )
-            # Then border (fixed)
-            border_px = max(1, int(round(sp.border_width_pt * px_per_pt_x)))
-            draw.rectangle(
-                [l, t, r, b],
-                outline=(int(border_rgb[0]*255), int(border_rgb[1]*255), int(border_rgb[2]*255), alpha),
-                width=border_px
-            )
-            # Text layer (rotate separately so border stays crisp)
+            # TEXT STAMP — Boxed or Tiled
+            text_rgb = HexColor(sp.text_color_hex).rgb()
+            text_rgba = (int(text_rgb[0]*255), int(text_rgb[1]*255), int(text_rgb[2]*255), 255)
             try:
-                text_rgb = HexColor(sp.text_color_hex).rgb()
-                text_rgba = (int(text_rgb[0]*255), int(text_rgb[1]*255), int(text_rgb[2]*255), 255)
                 try:
                     font = ImageFont.truetype("arial.ttf", max(8, int(sp.font_size_pt * px_per_pt_y)))
                 except Exception:
                     font = ImageFont.load_default()
+            except Exception:
+                font = ImageFont.load_default()
+
+            if getattr(sp, "tiled", False):
+                # TILED MODE: repeat text across the entire page at tile_angle_deg
+                angle = getattr(sp, "tile_angle_deg", sp.rotation_deg)
+                dx_pt = mm_to_pt(getattr(sp, "tile_dx_mm", 60.0))
+                dy_pt = mm_to_pt(getattr(sp, "tile_dy_mm", 60.0))
+                dx_px = max(6, int(dx_pt * px_per_pt_x))
+                dy_px = max(6, int(dy_pt * px_per_pt_y))
+
+                txt_layer = Image.new("RGBA", (page.width, page.height), (0,0,0,0))
+
+                # Prepare a text sprite
+                temp = Image.new("RGBA", (1,1), (0,0,0,0))
+                tempd = ImageDraw.Draw(temp)
+                tw, th = tempd.textbbox((0,0), sp.text, font=font)[2:]
+
+                sprite_w = tw + 4
+                sprite_h = th + 4
+                base_sprite = Image.new("RGBA", (sprite_w, sprite_h), (0,0,0,0))
+                spr_d = ImageDraw.Draw(base_sprite)
+                spr_d.text((2,2), sp.text, fill=text_rgba, font=font)
+
+                rot_sprite = base_sprite.rotate(-angle, resample=Image.BICUBIC, expand=True)
+
+                # offset grid by (x_mm, y_mm)
+                off_x_px = int(mm_to_pt(sp.x_mm) * px_per_pt_x)
+                off_y_px = int(mm_to_pt(sp.y_mm) * px_per_pt_y)
+
+                for y in range(-page.height, page.height*2, dy_px):
+                    for x in range(-page.width, page.width*2, dx_px):
+                        px_ = x + off_x_px
+                        py_ = y + off_y_px
+                        txt_layer.alpha_composite(rot_sprite, (px_, py_))
+
+                overlay = Image.alpha_composite(overlay, txt_layer)
+
+            else:
+                # BOX MODE: rectangle + border + centered text + rotation
+                fill_rgb = HexColor(sp.rect_fill_hex).rgb()
+                border_rgb = HexColor(sp.rect_border_hex).rgb()
+                alpha = int(round(255 * (1.0 - sp.rect_opacity)))
+
+                # Draw fill
+                draw.rectangle(
+                    [l, t, r, b],
+                    fill=(int(fill_rgb[0]*255), int(fill_rgb[1]*255), int(fill_rgb[2]*255), alpha)
+                )
+                # Border (scaled to pixels)
+                border_px = max(1, int(round(sp.border_width_pt * px_per_pt_x)))
+                draw.rectangle(
+                    [l, t, r, b],
+                    outline=(int(border_rgb[0]*255), int(border_rgb[1]*255), int(border_rgb[2]*255), alpha),
+                    width=border_px
+                )
+
+                # Draw text in its own layer, then rotate so border stays crisp
                 text_layer = Image.new("RGBA", page.size, (0,0,0,0))
                 td = ImageDraw.Draw(text_layer)
                 tw, th = td.textbbox((0,0), sp.text, font=font)[2:]
@@ -270,8 +335,6 @@ def draw_preview_overlay_for_page(
                 td.text((tx, ty), sp.text, fill=text_rgba, font=font)
                 text_layer = text_layer.rotate(-sp.rotation_deg, resample=Image.BICUBIC)
                 overlay = Image.alpha_composite(overlay, text_layer)
-            except Exception:
-                pass
 
     return Image.alpha_composite(page, overlay)
 
@@ -289,41 +352,73 @@ def build_overlay_pdf_for_page(stamps: List[Stamp], page_idx0: int, page_w_pt: f
         w_pt, h_pt = mm_to_pt(sp.w_mm), mm_to_pt(sp.h_mm)
 
         can.saveState()
-        # rotate around center
-        cx = x_pt + w_pt/2
-        cy = y_pt + h_pt/2
-        can.translate(cx, cy)
-        can.rotate(sp.rotation_deg)
-        can.translate(-w_pt/2, -h_pt/2)
 
         if sp.stamp_type == "image" and sp.image_bytes:
+            # Rotate around center of the box for consistency
+            cx = x_pt + w_pt/2
+            cy = y_pt + h_pt/2
+            can.translate(cx, cy)
+            can.rotate(sp.rotation_deg)
+            can.translate(-w_pt/2, -h_pt/2)
             can.drawImage(ImageReader(io.BytesIO(sp.image_bytes)), 0, 0, width=w_pt, height=h_pt, mask='auto')
-        else:
-            fill = HexColor(sp.rect_fill_hex)
-            border = HexColor(sp.rect_border_hex)
-            text_c = HexColor(sp.text_color_hex)
-            can.setLineWidth(sp.border_width_pt)
-            can.setStrokeColor(border)
-            can.setFillColor(fill)
-            alpha = max(0.0, min(1.0, 1.0 - float(sp.rect_opacity)))
-            ensure_alpha(can, fill_alpha=alpha, stroke_alpha=alpha)
-            can.rect(0, 0, w_pt, h_pt, stroke=1, fill=1)
 
-            font_name = pick_font_name(sp.bold, sp.italic)
+        elif sp.stamp_type == "text":
+            text_c = HexColor(sp.text_color_hex)
             can.setFillColor(text_c)
+            font_name = pick_font_name(sp.bold, sp.italic)
             can.setFont(font_name, float(sp.font_size_pt))
-            pad = mm_to_pt(sp.padding_mm)
-            box_w, box_h = max(0.0, w_pt - 2*pad), max(0.0, h_pt - 2*pad)
-            lines = simpleSplit(sp.text or "", font_name, float(sp.font_size_pt), box_w)
-            leading = float(sp.font_size_pt) * 1.2
-            total_h = leading * len(lines)
-            start_y = max((h_pt - total_h) / 2.0, pad)
-            for i, line in enumerate(lines):
-                lw = can.stringWidth(line, font_name, float(sp.font_size_pt))
-                tx = max((w_pt - lw) / 2.0, pad)
-                ty = start_y + leading * (len(lines) - 1 - i)
-                if ty < pad: break
-                can.drawString(tx, ty, line)
+
+            if sp.tiled:
+                # Full-page repeat tiles at tile_angle_deg; ignore box rect
+                dx_pt = mm_to_pt(sp.tile_dx_mm)
+                dy_pt = mm_to_pt(sp.tile_dy_mm)
+                angle = sp.tile_angle_deg
+                # offset grid origin using (x_mm, y_mm)
+                off_x = mm_to_pt(sp.x_mm)
+                off_y = mm_to_pt(sp.y_mm)
+
+                alpha = max(0.0, min(1.0, 1.0 - float(sp.rect_opacity)))
+                for y in range(-int(page_h_pt), int(page_h_pt*2), int(max(6, dy_pt))):
+                    for x in range(-int(page_w_pt), int(page_w_pt*2), int(max(6, dx_pt))):
+                        can.saveState()
+                        can.translate(x + off_x, y + off_y)
+                        can.rotate(angle)
+                        ensure_alpha(can, fill_alpha=alpha, stroke_alpha=alpha)
+                        can.drawString(0, 0, sp.text or "")
+                        can.restoreState()
+
+            else:
+                # BOX MODE: draw rect + border + centered text inside the box (with rotation)
+                cx = x_pt + w_pt/2
+                cy = y_pt + h_pt/2
+                can.translate(cx, cy)
+                can.rotate(sp.rotation_deg)
+                can.translate(-w_pt/2, -h_pt/2)
+
+                fill = HexColor(sp.rect_fill_hex)
+                border = HexColor(sp.rect_border_hex)
+                can.setLineWidth(sp.border_width_pt)
+                can.setStrokeColor(border)
+                can.setFillColor(fill)
+                alpha = max(0.0, min(1.0, 1.0 - float(sp.rect_opacity)))
+                ensure_alpha(can, fill_alpha=alpha, stroke_alpha=alpha)
+                can.rect(0, 0, w_pt, h_pt, stroke=1, fill=1)
+
+                # Center text within padded box
+                can.setFillColor(text_c)
+                pad = mm_to_pt(sp.padding_mm)
+                box_w, box_h = max(0.0, w_pt - 2*pad), max(0.0, h_pt - 2*pad)
+                lines = simpleSplit(sp.text or "", font_name, float(sp.font_size_pt), box_w)
+                leading = float(sp.font_size_pt) * 1.2
+                total_h = leading * len(lines)
+                start_y = max((h_pt - total_h) / 2.0, pad)
+                for i, line in enumerate(lines):
+                    lw = can.stringWidth(line, font_name, float(sp.font_size_pt))
+                    tx = max((w_pt - lw) / 2.0, pad)
+                    ty = start_y + leading * (len(lines) - 1 - i)
+                    if ty < pad: break
+                    can.drawString(tx, ty, line)
+
         can.restoreState()
 
     can.save()
@@ -331,22 +426,112 @@ def build_overlay_pdf_for_page(stamps: List[Stamp], page_idx0: int, page_w_pt: f
     return PdfReader(packet)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN LAYOUT — Preview (left) and Right Control Panel (form-based)
+# MAIN LAYOUT — Preview (left) and Right Control Panel (with Stamp Manager)
 main_col, right_col = st.columns([0.62, 0.38], gap="large")
 
-# RIGHT CONTROL PANEL — edit LAST stamp ONLY, apply on submit
+# RIGHT CONTROL PANEL — Multi-Stamp Manager + form to edit SELECTED stamp
 with right_col:
-    st.header("Control Panel (Apply on Enter)")
-    apply_now = False
-
+    st.header("Stamp Manager")
     if not st.session_state.stamps:
         st.info("Add a stamp from the left sidebar to edit it here.")
+        apply_now = False
     else:
-        last_idx = len(st.session_state.stamps) - 1
-        last = st.session_state.stamps[last_idx]
+        # selection model
+        labels = []
+        for i, s in enumerate(st.session_state.stamps):
+            kind = "IMG" if s.stamp_type == "image" else "TXT"
+            desc = (s.text[:18] + "…") if (s.stamp_type == "text" and s.text and len(s.text) > 18) else (s.text or "")
+            labels.append(f"#{i+1} [{kind}] p{s.page_from}-{s.page_to} {desc}")
+        default_index = st.session_state.selected_stamp_index
+        if default_index is None or default_index >= len(st.session_state.stamps):
+            default_index = len(st.session_state.stamps) - 1
+        selected = st.selectbox("Select a stamp to edit", options=list(range(len(labels))), format_func=lambda i: labels[i], index=default_index)
+        st.session_state.selected_stamp_index = selected
 
-        with st.form(key="last_stamp_editor", clear_on_submit=False):
-            st.caption("Editing the most recently added stamp. Changes apply when you press **Enter** or click **Update Preview**.")
+        # Reorder / duplicate / delete
+        cact1, cact2, cact3, cact4 = st.columns(4)
+        with cact1:
+            move_up = st.button("⬆ Up", use_container_width=True, disabled=(selected == 0))
+        with cact2:
+            move_down = st.button("⬇ Down", use_container_width=True, disabled=(selected >= len(st.session_state.stamps)-1))
+        with cact3:
+            dup = st.button("🧬 Duplicate", use_container_width=True)
+        with cact4:
+            del_req = st.button("🗑 Delete", use_container_width=True)
+
+        if move_up:
+            stamps = st.session_state.stamps
+            stamps[selected-1], stamps[selected] = stamps[selected], stamps[selected-1]
+            st.session_state.stamps = stamps
+            st.session_state.selected_stamp_index = selected-1
+            st.session_state.preview_update_requested = True
+            st.rerun()
+
+        if move_down:
+            stamps = st.session_state.stamps
+            stamps[selected+1], stamps[selected] = stamps[selected], stamps[selected+1]
+            st.session_state.stamps = stamps
+            st.session_state.selected_stamp_index = selected+1
+            st.session_state.preview_update_requested = True
+            st.rerun()
+
+        if dup:
+            stamps = st.session_state.stamps
+            import copy
+            clone = copy.deepcopy(stamps[selected])
+            stamps.insert(selected+1, clone)
+            st.session_state.stamps = stamps
+            st.session_state.selected_stamp_index = selected+1
+            st.session_state.preview_update_requested = True
+            st.success("Stamp duplicated.")
+            st.rerun()
+
+        # DELETE Logic with proper confirmation
+        if "delete_pending" not in st.session_state:
+            st.session_state.delete_pending = None  # store index for pending delete
+
+        if del_req:
+            st.session_state.delete_pending = selected
+
+        # Show confirmation only if pending deletion
+        if st.session_state.delete_pending is not None:
+            st.warning(f"⚠ Are you sure you want to delete stamp #{st.session_state.delete_pending+1}? This action cannot be undone.")
+            cdel1, cdel2 = st.columns([0.5, 0.5])
+            with cdel1:
+                confirm_delete = st.button("✅ Yes, Delete", key="confirm_delete")
+            with cdel2:
+                cancel_delete = st.button("❌ Cancel", key="cancel_delete")
+
+            if confirm_delete:
+                idx_to_del = st.session_state.delete_pending
+                stamps = st.session_state.stamps
+                stamps.pop(idx_to_del)
+                st.session_state.stamps = stamps
+                st.session_state.delete_pending = None
+                # Adjust selected index
+                if len(stamps) == 0:
+                    st.session_state.selected_stamp_index = None
+                else:
+                    st.session_state.selected_stamp_index = max(0, idx_to_del - 1)
+                st.session_state.preview_update_requested = True
+                st.success("Stamp deleted successfully.")
+                st.rerun()
+
+            if cancel_delete:
+                st.session_state.delete_pending = None
+                st.info("Deletion canceled.")
+
+
+        st.markdown("---")
+
+        # Editor for the SELECTED stamp
+        last = st.session_state.stamps[st.session_state.selected_stamp_index]
+        st.subheader("Edit Selected Stamp (apply on Enter)")
+
+        with st.form(key="selected_stamp_editor", clear_on_submit=False):
+            st.caption("Changes apply when you press **Enter** or click **Update Preview**.")
+
+            st.write(f"Editing: **#{st.session_state.selected_stamp_index+1}** — **{last.stamp_type.upper()}**")
 
             st.subheader("Page Range (this stamp only)")
             npages = num_pages if num_pages > 0 else 1
@@ -367,7 +552,7 @@ with right_col:
             rotation = st.slider("Rotation (°)", -180.0, 180.0, last.rotation_deg, 1.0)
 
             if last.stamp_type == "image":
-                up2 = st.file_uploader("Replace image (optional)", type=["png", "jpg", "jpeg"], key="replace_img_form")
+                up2 = st.file_uploader("Replace image (optional)", type=["png", "jpg", "jpeg"], key=f"replace_img_{st.session_state.selected_stamp_index}")
             else:
                 st.subheader("Text & Style")
                 cx1, cx2, cx3 = st.columns(3)
@@ -375,18 +560,27 @@ with right_col:
                 with cx2: italic = st.checkbox("Italic", value=last.italic)
                 with cx3: font_size_pt = st.number_input("Font size (pt)", 8, 200, last.font_size_pt)
 
-                text_val = st.text_input("Text", value=last.text)
+                text_val = st.text_input("Text", value=last.text, key=f"text_{st.session_state.selected_stamp_index}")
 
                 cx4, cx5 = st.columns(2)
                 with cx4:
-                    rect_fill_hex = st.color_picker("Rect fill", value=last.rect_fill_hex)
-                    rect_opacity = st.slider("Rect transparency (0→1)", 0.0, 1.0, last.rect_opacity, 0.05)
+                    rect_fill_hex = st.color_picker("Rect fill", value=last.rect_fill_hex, key=f"fill_{st.session_state.selected_stamp_index}")
+                    rect_opacity = st.slider("Rect transparency (0→1)", 0.0, 1.0, last.rect_opacity, 0.05, key=f"opc_{st.session_state.selected_stamp_index}")
                 with cx5:
-                    rect_border_hex = st.color_picker("Rect border", value=last.rect_border_hex)
-                    border_width_pt = st.number_input("Border width (pt)", 0.0, 12.0, last.border_width_pt, 0.5)
+                    rect_border_hex = st.color_picker("Rect border", value=last.rect_border_hex, key=f"bor_{st.session_state.selected_stamp_index}")
+                    border_width_pt = st.number_input("Border width (pt)", 0.0, 12.0, last.border_width_pt, 0.5, key=f"bw_{st.session_state.selected_stamp_index}")
 
-                text_color_hex = st.color_picker("Text color", value=last.text_color_hex)
-                padding_mm = st.number_input("Padding (mm)", 0.0, 50.0, last.padding_mm, 0.5)
+                text_color_hex = st.color_picker("Text color", value=last.text_color_hex, key=f"txtc_{st.session_state.selected_stamp_index}")
+                padding_mm = st.number_input("Padding (mm)", 0.0, 50.0, last.padding_mm, 0.5, key=f"pad_{st.session_state.selected_stamp_index}")
+
+                st.subheader("Tiled Watermark (Full Page)")
+                last_tiled = st.checkbox("Enable tiled mode", value=last.tiled, key=f"tiled_{st.session_state.selected_stamp_index}")
+                tc1, tc2 = st.columns(2)
+                with tc1:
+                    tile_dx_mm = st.number_input("Tile spacing X (mm)", 10.0, 500.0, last.tile_dx_mm, 1.0, key=f"dx_{st.session_state.selected_stamp_index}")
+                with tc2:
+                    tile_dy_mm = st.number_input("Tile spacing Y (mm)", 10.0, 500.0, last.tile_dy_mm, 1.0, key=f"dy_{st.session_state.selected_stamp_index}")
+                tile_angle_deg = st.slider("Tile angle (°)", -180.0, 180.0, last.tile_angle_deg, 1.0, key=f"ang_{st.session_state.selected_stamp_index}")
 
             submit = st.form_submit_button("🔄 Update Preview", use_container_width=True)
 
@@ -408,11 +602,16 @@ with right_col:
                 last.border_width_pt = border_width_pt
                 last.text_color_hex = text_color_hex
                 last.padding_mm = padding_mm
-            st.session_state.stamps[last_idx] = last
+                last.tiled = last_tiled
+                last.tile_dx_mm = tile_dx_mm
+                last.tile_dy_mm = tile_dy_mm
+                last.tile_angle_deg = tile_angle_deg
+
+            st.session_state.stamps[st.session_state.selected_stamp_index] = last
             st.rerun()
 
     st.markdown("---")
-    # Apply button (explicit action)
+    # Apply button (explicit action, visible even if no stamps selected)
     apply_now = st.button("✅ Apply Stamp(s) to PDF", use_container_width=True)
 
 # LEFT (CENTER) — Preview with spinner on update
