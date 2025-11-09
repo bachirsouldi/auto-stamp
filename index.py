@@ -68,7 +68,7 @@ with col2:
     if st.button("🚪 Logout", use_container_width=True):
         st.session_state.authenticated = False
         st.session_state.current_user = None
-        st.experimental_rerun()
+        st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -205,6 +205,58 @@ with st.sidebar:
 
     st.markdown("---")
     st.header("Add New Stamp")
+
+    auto_sign = st.checkbox("Add automatic digital signature", False)
+
+    if auto_sign:
+        default_x = 145.0
+        default_y = 10.0
+        default_w = 60.0
+        default_h = 20.0
+
+        use_default_pos = st.checkbox("Use default position (bottom-right corner)", True)
+
+        if not use_default_pos:
+            default_x = st.number_input("X (mm)", 0.0, 5000.0, 180.0)
+            default_y = st.number_input("Y (mm)", 0.0, 5000.0, 15.0)
+            default_w = st.number_input("Width (mm)", 5.0, 5000.0, 60.0)
+            default_h = st.number_input("Height (mm)", 5.0, 5000.0, 20.0)
+
+        if st.button("🖋 Add Digital Signature Stamp"):
+            username = st.session_state.current_user or "Unknown User"
+            import datetime
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            sig_text = f"Digitally signed by {username}\nDate: {now}"
+
+            ss.stamps.append(
+                Stamp(
+                    stamp_type="text",
+                    x_mm=default_x,
+                    y_mm=default_y,
+                    w_mm=default_w,
+                    h_mm=default_h,
+                    rotation_deg=0,
+                    page_from=1,
+                    page_to=max(1, num_pages) if num_pages else 1,
+                    text=sig_text,
+                    font_size_pt=10,
+                    bold=False,
+                    italic=False,
+                    rect_fill_hex="#FFFFFF",
+                    rect_border_hex="#000000",
+                    text_color_hex="#000000",
+                    rect_opacity=0.0,
+                    border_width_pt=0.5,
+                    padding_mm=2.0,
+                    tiled=False
+                )
+            )
+            st.success("✅ Digital signature added successfully!")
+            st.session_state.selected_stamp_index = len(ss.stamps) - 1
+            st.rerun()
+
+
     new_type = st.radio("Type", ["image", "text"], horizontal=True)
     nx = st.number_input("X (mm)", 0.0, 5000.0, 50.0)
     ny = st.number_input("Y (mm)", 0.0, 5000.0, 50.0)
@@ -675,7 +727,13 @@ with right_col:
             with cg2:
                 y_mm = st.number_input("Y (mm)", 0.0, 5000.0, editing.y_mm, 1.0, key=f"y_{sidx}")
                 h_mm = st.number_input("Height (mm)", 5.0, 5000.0, editing.h_mm, 1.0, key=f"h_{sidx}")
-            rotation = st.slider("Rotation (°)", -180.0, 180.0, editing.rotation_deg, 1.0, key=f"rot_{sidx}")
+            rotation = st.slider(
+                "Rotation (°)",
+                -180.0, 180.0,
+                float(editing.rotation_deg),
+                1.0,
+                key=f"rot_{sidx}"
+            )
 
             if editing.stamp_type == "image":
                 up2 = st.file_uploader("Replace image (optional)", type=["png", "jpg", "jpeg"], key=f"replace_img_{sidx}")
@@ -739,8 +797,13 @@ with right_col:
     st.markdown("---")
 
     # 🔐 SECURITY OPTIONS (expander, optional)
+    # 🔐 SECURITY OPTIONS (expander, optional)
     with st.expander("🔐 PDF Security Options (optional)", expanded=False):
-        st.session_state.sec_enabled = st.checkbox("Enable password protection", value=st.session_state.sec_enabled, key="sec_enable")
+        st.session_state.sec_enabled = st.checkbox(
+            "Enable password protection",
+            value=st.session_state.sec_enabled,
+            key="sec_enable"
+        )
 
         if st.session_state.sec_enabled:
             csec1, csec2 = st.columns(2)
@@ -761,7 +824,14 @@ with right_col:
                     key="sec_owner_input"
                 )
 
-            # Guidance + live validation hints
+            st.markdown("### Restrict PDF Actions")
+            st.session_state.sec_disable_print = st.checkbox("🖨️ Disable printing", True)
+            st.session_state.sec_disable_copy = st.checkbox("📋 Disable text copying", True)
+            st.session_state.sec_disable_modify = st.checkbox("✏️ Disable modifications", True)
+            st.session_state.sec_disable_annotate = st.checkbox("💬 Disable annotations/comments", True)
+            st.session_state.sec_disable_formfill = st.checkbox("📝 Disable form filling", True)
+            st.session_state.sec_disable_accessibility = st.checkbox("♿ Disable accessibility extract", True)
+
             if not st.session_state.sec_user_pw or not st.session_state.sec_owner_pw:
                 st.info("Enter both passwords to enable protection.")
             elif st.session_state.sec_user_pw == st.session_state.sec_owner_pw:
@@ -795,9 +865,21 @@ with main_col:
                     st.session_state.preview_page_index -= 1
                     st.rerun()
             with nav2:
-                st.session_state.preview_page_index = st.slider(
-                    "Preview page", 1, total_preview_pages, st.session_state.preview_page_index + 1, 1
-                ) - 1
+                if total_preview_pages > 1:
+                    # normal slider if multiple pages
+                    st.session_state.preview_page_index = (
+                        st.slider(
+                            "Preview page",
+                            1,
+                            total_preview_pages,
+                            st.session_state.preview_page_index + 1,
+                            1
+                        ) - 1
+                    )
+                else:
+                    # single-page PDF: avoid error and still preview it
+                    st.session_state.preview_page_index = 0
+                    st.caption("📄 This PDF has only one page. Showing the single preview.")            
             with nav3:
                 if st.button("Next ▶", use_container_width=True) and st.session_state.preview_page_index < total_preview_pages - 1:
                     st.session_state.preview_page_index += 1
@@ -840,11 +922,31 @@ if apply_now:
 
             # Optional encryption (maximum lockdown)
             if st.session_state.sec_enabled:
-                # In PyPDF2, encrypt with user & owner password; 128-bit by default
-                # Not specifying permissions implies restrictive defaults.
+                # Default: everything allowed (base = -4)
+                permissions = 0xFFFFFFFC  # (-4) in 32-bit signed form
+
+                # Deny actions based on toggles
+                if st.session_state.sec_disable_print:
+                    permissions &= ~0b100            # disable printing
+                if st.session_state.sec_disable_modify:
+                    permissions &= ~0b10000          # disable document modification
+                if st.session_state.sec_disable_copy:
+                    permissions &= ~0b100000         # disable text copying/extract
+                if st.session_state.sec_disable_annotate:
+                    permissions &= ~0b1000000        # disable annotations/comments
+                if st.session_state.sec_disable_formfill:
+                    permissions &= ~0b1000000000     # disable form filling
+                if st.session_state.sec_disable_accessibility:
+                    permissions &= ~0b10000000000    # disable accessibility extract (e.g. screen readers)
+
+                # Ensure value fits signed 32-bit range
+                if permissions > 0x7FFFFFFF:
+                    permissions -= 0x100000000
+
                 writer.encrypt(
                     user_password=st.session_state.sec_user_pw,
                     owner_password=st.session_state.sec_owner_pw,
+                    permissions_flag=permissions,
                     use_128bit=True
                 )
 
