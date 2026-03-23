@@ -15,14 +15,26 @@ from typing import List, Optional, Tuple
 
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
-from PyPDF2 import PdfReader, PdfWriter
+from PyPDF2 import PdfReader, PdfWriter ,errors
 from reportlab.pdfgen import canvas as rl_canvas
 from reportlab.lib.units import mm
 from reportlab.lib.colors import HexColor
 from reportlab.lib.utils import ImageReader, simpleSplit
 import pypdfium2 as pdfium
 import streamlit.components.v1 as components
-
+from PyPDF2.errors import FileNotDecryptedError
+from PyPDF2 import PdfMerger
+import pypdfium2 as pdfium
+from PIL import Image
+from reportlab.pdfgen import canvas
+import io
+import tempfile
+import subprocess
+from PyPDF2 import PdfReader
+from PyPDF2.errors import FileNotDecryptedError
+from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
+import streamlit as st
 
 hide_st_style = """
     <style>
@@ -249,39 +261,46 @@ def run_watermark_tool():
                 default_w = st.number_input("Width (mm)", 5.0, 5000.0, 60.0)
                 default_h = st.number_input("Height (mm)", 5.0, 5000.0, 20.0)
 
+            username = st.session_state.current_user or "Unknown User"
+            default_sig_action = "Digitally signed"
+            
+            sig_action = st.text_area("Signature Action (User and Date are added automatically)", value=default_sig_action, height=60)
+
             if st.button("🖋 Add Digital Signature Stamp"):
-                username = st.session_state.current_user or "Unknown User"
-                import datetime
-                now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-                sig_text = f"Digitally signed by {username}\nDate: {now}"
-
-                ss.stamps.append(
-                    Stamp(
-                        stamp_type="text",
-                        x_mm=default_x,
-                        y_mm=default_y,
-                        w_mm=default_w,
-                        h_mm=default_h,
-                        rotation_deg=0,
-                        page_from=1,
-                        page_to=max(1, num_pages) if num_pages else 1,
-                        text=sig_text,
-                        font_size_pt=10,
-                        bold=False,
-                        italic=False,
-                        rect_fill_hex="#FFFFFF",
-                        rect_border_hex="#000000",
-                        text_color_hex="#000000",
-                        rect_opacity=0.0,
-                        border_width_pt=0.5,
-                        padding_mm=2.0,
-                        tiled=False
+                if not sig_action.strip():
+                    st.error("Signature action cannot be empty!")
+                else:
+                    import datetime
+                    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    final_sig_text = f"{sig_action.strip()} by {username}\nDate: {now_str}"
+                    
+                    ss.stamps.append(
+                        Stamp(
+                            stamp_type="text",
+                            x_mm=default_x,
+                            y_mm=default_y,
+                            w_mm=default_w,
+                            h_mm=default_h,
+                            rotation_deg=0,
+                            page_from=1,
+                            page_to=max(1, num_pages) if num_pages else 1,
+                            text=final_sig_text,
+                            font_size_pt=10,
+                            bold=False,
+                            italic=False,
+                            rect_fill_hex="#FFFFFF",
+                            rect_border_hex="#000000",
+                            text_color_hex="#000000",
+                            rect_opacity=0.0,
+                            border_width_pt=0.5,
+                            padding_mm=2.0,
+                            tiled=False
+                        )
                     )
-                )
-                st.success("✅ Digital signature added successfully!")
-                st.session_state.selected_stamp_index = len(ss.stamps) - 1
-                st.rerun()
+                    
+                    st.success("✅ Digital signature added successfully!")
+                    st.session_state.selected_stamp_index = len(ss.stamps) - 1
+                    st.rerun()
 
 
         new_type = st.radio("Type", ["image", "text"], horizontal=True)
@@ -312,11 +331,11 @@ def run_watermark_tool():
             if up:
                 n_img = compress_image(up.read())
         else:
-            n_text = st.text_input("Text", "CONFIDENTIAL")
+            n_text = st.text_input("Text", "CONTROL COPY")
             c1, c2, c3 = st.columns(3)
             with c1: n_bold = st.checkbox("Bold", True)
             with c2: n_italic = st.checkbox("Italic", False)
-            with c3: n_font = st.number_input("Font size (pt)", 8, 200, 48)
+            with c3: n_font = st.number_input("Font size (pt)", 8, 200, 28)
             c4, c5 = st.columns(2)
             with c4:
                 n_fill = st.color_picker("Rect fill", "#FFFFFF")
@@ -327,7 +346,7 @@ def run_watermark_tool():
             n_text_col = st.color_picker("Text color", "#000000")
             n_pad = st.number_input("Padding (mm)", 0.0, 50.0, 3.0, 0.5)
             with st.expander("Tiled watermark (text only)"):
-                n_tiled = st.checkbox("Enable tiled mode", True)
+                n_tiled = st.checkbox("Enable tiled mode", False)
                 n_tile_dx_mm = st.number_input("Tile spacing X (mm)", 10.0, 500.0, 120.0, 1.0)
                 n_tile_dy_mm = st.number_input("Tile spacing Y (mm)", 10.0, 500.0, 120.0, 1.0)
                 n_tile_angle = st.slider("Tile angle (°)", -180.0, 180.0, 45.0)
@@ -934,6 +953,45 @@ def run_watermark_tool():
                 if st.session_state.sec_user_pw == st.session_state.sec_owner_pw:
                     st.error("User and Owner passwords must be different.")
                     st.stop()
+            
+            # START SIGNING
+            username = st.session_state.current_user or "Unknown User"
+            default_x = 145.0
+            default_y = 10.0
+            default_w = 60.0
+            default_h = 20.0
+            import datetime
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            sig_text = f"Digitally signed by {username}\nDate: {now}"
+
+            ss.stamps.append(
+                Stamp(
+                    stamp_type="text",
+                    x_mm=default_x,
+                    y_mm=default_y,
+                    w_mm=default_w,
+                    h_mm=default_h,
+                    rotation_deg=0,
+                    page_from=1,
+                    page_to=max(1, num_pages) if num_pages else 1,
+                    text=sig_text,
+                    font_size_pt=10,
+                    bold=False,
+                    italic=False,
+                    rect_fill_hex="#FFFFFF",
+                    rect_border_hex="#000000",
+                    text_color_hex="#000000",
+                    rect_opacity=0.0,
+                    border_width_pt=0.5,
+                    padding_mm=2.0,
+                    tiled=False
+                )
+            )
+            st.success("✅ Digital signature added successfully!")
+            st.session_state.selected_stamp_index = len(ss.stamps) - 1
+            # st.rerun()
+            # END SIGNING SIGNING
 
             with st.spinner("Applying stamps to PDF..."):
                 reader = PdfReader(io.BytesIO(st.session_state.pdf_bytes))
@@ -990,98 +1048,157 @@ def run_watermark_tool():
                 st.success("✅ Done! Stamps applied.")
 
 
-from PyPDF2 import PdfMerger
+
 
 def merge_pdf_tool():
     st.header("🔗 Merge PDFs")
-    files = st.file_uploader("Upload PDFs to merge", type="pdf", accept_multiple_files=True,    key="merge_upload")
+    files = st.file_uploader("Upload PDFs to merge", type="pdf", accept_multiple_files=True, key="merge_upload")
+
     if files and st.button("Merge PDFs"):
         merger = PdfMerger()
+        merged_files = []
+        skipped_files = []
+
         for f in files:
-            merger.append(io.BytesIO(f.read()))
-        out = io.BytesIO()
-        merger.write(out)
-        merger.close()
-        st.download_button("📥 Download merged PDF", out.getvalue(), "merged.pdf", "application/pdf")
-        st.success("✅ PDFs merged successfully!")
+            try:
+                file_bytes = io.BytesIO(f.read())
+                merger.append(file_bytes)
+                merged_files.append(f.name)
+            except FileNotDecryptedError:
+                skipped_files.append(f.name)
+                st.error(f"🔒 The file **{f.name}** is encrypted — could not merge it.")
+            except Exception as e:
+                skipped_files.append(f.name)
+                st.error(f"❌ Error merging {f.name}: {e}")
+
+        # ✅ Only show success if at least one file was merged
+        if merged_files:
+            out = io.BytesIO()
+            merger.write(out)
+            merger.close()
+            st.download_button(
+                "📥 Download merged PDF",
+                out.getvalue(),
+                "merged.pdf",
+                "application/pdf",
+            )
+            st.success(f"✅ Successfully merged {len(merged_files)} PDF(s).")
+
+            if skipped_files:
+                st.warning("⚠️ These files were skipped:")
+                for name in skipped_files:
+                    st.write(f"- {name}")
+        else:
+            st.warning("⚠️ No PDFs were merged (all were encrypted or invalid).")
 
 def split_pdf_tool():
     st.header("✂️ Split PDF by Pages")
     file = st.file_uploader("Upload PDF to split", type="pdf", key="split_upload")
+
     if file:
-        reader = PdfReader(io.BytesIO(file.read()))
-        num_pages = len(reader.pages)
-        st.info(f"PDF has {num_pages} pages.")
-        start = st.number_input("From page", 1, num_pages, 1)
-        end = st.number_input("To page", 1, num_pages, num_pages)
-        if st.button("Split PDF"):
-            writer = PdfWriter()
-            for i in range(start - 1, end):
-                writer.add_page(reader.pages[i])
-            out = io.BytesIO()
-            writer.write(out)
-            st.download_button("📥 Download split PDF", out.getvalue(), f"split_{start}-{end}.pdf", "application/pdf")
-            st.success(f"✅ Extracted pages {start}–{end}.")
+        try:
+            reader = PdfReader(io.BytesIO(file.read()))
+            if reader.is_encrypted:
+                st.error(f"🔒 The file **{file.name}** is encrypted — cannot split it.")
+                return
+
+            num_pages = len(reader.pages)
+            st.info(f"PDF has {num_pages} pages.")
+            start = st.number_input("From page", 1, num_pages, 1)
+            end = st.number_input("To page", 1, num_pages, num_pages)
+
+            if st.button("Split PDF"):
+                writer = PdfWriter()
+                for i in range(start - 1, end):
+                    writer.add_page(reader.pages[i])
+
+                out = io.BytesIO()
+                writer.write(out)
+                st.download_button("📥 Download split PDF", out.getvalue(),
+                                   f"split_{start}-{end}.pdf", "application/pdf")
+                st.success(f"✅ Extracted pages {start}–{end}.")
+        except FileNotDecryptedError:
+            st.error("🔒 This file is encrypted — cannot split.")
+        except Exception as e:
+            st.error(f"❌ Failed to process file: {e}")
 
 def extract_pages_tool():
     st.header("📄 Extract Specific Pages")
     file = st.file_uploader("Upload PDF", type="pdf", key="extract_pages_upload")
     pages = st.text_input("Enter pages (e.g., 1,3,5-7)")
+
     if file and st.button("Extract"):
-        reader = PdfReader(io.BytesIO(file.read()))
-        writer = PdfWriter()
-        indices = []
-        for part in pages.split(','):
-            if '-' in part:
-                a, b = map(int, part.split('-'))
-                indices.extend(range(a-1, b))
-            else:
-                indices.append(int(part)-1)
-        for i in indices:
-            if 0 <= i < len(reader.pages):
-                writer.add_page(reader.pages[i])
-        out = io.BytesIO()
-        writer.write(out)
-        st.download_button("📥 Download extracted PDF", out.getvalue(), "extracted.pdf", "application/pdf")
-        st.success("✅ Pages extracted successfully!")
+        try:
+            reader = PdfReader(io.BytesIO(file.read()))
+            if reader.is_encrypted:
+                st.error(f"🔒 The file **{file.name}** is encrypted — cannot extract pages.")
+                return
+
+            writer = PdfWriter()
+            indices = []
+            for part in pages.split(','):
+                if '-' in part:
+                    a, b = map(int, part.split('-'))
+                    indices.extend(range(a - 1, b))
+                else:
+                    indices.append(int(part) - 1)
+
+            for i in indices:
+                if 0 <= i < len(reader.pages):
+                    writer.add_page(reader.pages[i])
+
+            out = io.BytesIO()
+            writer.write(out)
+            st.download_button("📥 Download extracted PDF", out.getvalue(),
+                               "extracted.pdf", "application/pdf")
+            st.success("✅ Pages extracted successfully!")
+        except FileNotDecryptedError:
+            st.error("🔒 File is encrypted — cannot extract pages.")
+        except Exception as e:
+            st.error(f"❌ Failed to extract pages: {e}")
 
 def extract_text_tool():
     st.header("🔍 Extract Text from PDF")
     file = st.file_uploader("Upload PDF", type="pdf", key="extract_text_upload")
-    if file and st.button("Extract Text"):
-        reader = PdfReader(io.BytesIO(file.read()))
-        text = "\n".join(page.extract_text() or "" for page in reader.pages)
-        st.download_button("📄 Download extracted text", text, "extracted.txt", "text/plain")
-        st.text_area("Preview extracted text", text[:3000])
 
-import pypdfium2 as pdfium
-from PIL import Image
+    if file and st.button("Extract Text"):
+        try:
+            reader = PdfReader(io.BytesIO(file.read()))
+            if reader.is_encrypted:
+                st.error(f"🔒 The file **{file.name}** is encrypted — cannot extract text.")
+                return
+
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+            st.download_button("📄 Download extracted text", text, "extracted.txt", "text/plain")
+            st.text_area("Preview extracted text", text[:3000])
+        except FileNotDecryptedError:
+            st.error("🔒 File is encrypted — cannot extract text.")
+        except Exception as e:
+            st.error(f"❌ Failed to extract text: {e}")
+
 
 def convert_to_images_tool():
     st.header("🖼 Convert PDF Pages to Images")
     file = st.file_uploader("Upload PDF", type="pdf", key="convert_image_upload")
+
     if file and st.button("Convert"):
-        pdf = pdfium.PdfDocument(io.BytesIO(file.read()))
-        for i, page in enumerate(pdf):
-            img = page.render(scale=2).to_pil()
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            st.image(img, caption=f"Page {i+1}")
-            st.download_button(f"⬇ Download Page {i+1}", buf.getvalue(), f"page_{i+1}.png", "image/png")
-        pdf.close()
+        try:
+            pdf = pdfium.PdfDocument(io.BytesIO(file.read()))
+            for i, page in enumerate(pdf):
+                img = page.render(scale=2).to_pil()
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                st.image(img, caption=f"Page {i+1}")
+                st.download_button(f"⬇ Download Page {i+1}",
+                                   buf.getvalue(), f"page_{i+1}.png", "image/png")
+            pdf.close()
+            st.success("✅ Conversion complete!")
+        except Exception as e:
+            if "encrypted" in str(e).lower():
+                st.error(f"🔒 The file **{file.name}** is encrypted — cannot convert to images.")
+            else:
+                st.error(f"❌ Failed to convert: {e}")
 
-import subprocess, tempfile, os
-
-
-import io, tempfile
-import streamlit as st
-from PyPDF2 import PdfReader
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.utils import ImageReader
-from PIL import Image
-import pypdfium2 as pdfium
-import subprocess, os
 
 def compress_pdf_tool():
     st.header("📦 Compress PDF")
@@ -1091,70 +1208,99 @@ def compress_pdf_tool():
     scale = st.slider("Render scale (affects resolution)", 0.5, 2.0, 1.0, 0.1)
 
     if file and st.button("Compress"):
-        input_bytes = file.read()
-        tmp_in = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-        tmp_in.write(input_bytes)
-        tmp_in.close()
-
-        # --- Try Ghostscript first ---
-        gs_found = False
-        for cmd in ["gs", "gswin64c", "gswin32c"]:
-            try:
-                subprocess.run([cmd, "--version"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                gs_found = cmd
-                break
-            except Exception:
-                continue
-
-        if gs_found:
-            st.info(f"✅ Ghostscript found: {gs_found}")
-            tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-            cmd = [
-                gs_found,
-                "-sDEVICE=pdfwrite",
-                "-dCompatibilityLevel=1.4",
-                "-dPDFSETTINGS=/ebook",
-                "-dNOPAUSE", "-dQUIET", "-dBATCH",
-                f"-sOutputFile={tmp_out.name}",
-                tmp_in.name,
-            ]
-            try:
-                subprocess.run(cmd, check=True)
-                with open(tmp_out.name, "rb") as f:
-                    st.download_button("📥 Download Compressed PDF", f, "compressed.pdf", "application/pdf")
-                st.success("✅ Compression successful via Ghostscript.")
-                return
-            except Exception as e:
-                st.warning(f"⚠️ Ghostscript failed ({e}), using Python fallback...")
-
-        # --- Fallback: Python-only rebuild ---
         try:
-            st.warning("Ghostscript not found — using Python fallback (may be slower).")
-            pdf = pdfium.PdfDocument(tmp_in.name)
-            output_buffer = io.BytesIO()
-            c = canvas.Canvas(output_buffer)
+            # --- Check for encryption early ---
+            reader = PdfReader(io.BytesIO(file.read()))
+            if reader.is_encrypted:
+                st.error(f"🔒 The file **{file.name}** is encrypted — cannot compress it.")
+                return
 
-            for i, page in enumerate(pdf):
-                pil_image = page.render(scale=scale).to_pil()
-                # Compress image
-                img_bytes = io.BytesIO()
-                pil_image.save(img_bytes, format="JPEG", quality=quality)
-                img_bytes.seek(0)
+            # Reset pointer and write to temporary file
+            file.seek(0)
+            input_bytes = file.read()
+            tmp_in = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+            tmp_in.write(input_bytes)
+            tmp_in.close()
 
-                # Draw image full-page
-                w, h = page.get_width(), page.get_height()
-                c.setPageSize((w, h))
-                c.drawImage(ImageReader(img_bytes), 0, 0, width=w, height=h)
-                c.showPage()
+            # --- Try Ghostscript first ---
+            gs_found = None
+            for cmd in ["gs", "gswin64c", "gswin32c"]:
+                try:
+                    subprocess.run([cmd, "--version"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    gs_found = cmd
+                    break
+                except Exception:
+                    continue
 
-            c.save()
-            pdf.close()
+            if gs_found:
+                st.info(f"✅ Ghostscript found: **{gs_found}**")
+                tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+                cmd = [
+                    gs_found,
+                    "-sDEVICE=pdfwrite",
+                    "-dCompatibilityLevel=1.4",
+                    "-dPDFSETTINGS=/ebook",
+                    "-dNOPAUSE", "-dQUIET", "-dBATCH",
+                    f"-sOutputFile={tmp_out.name}",
+                    tmp_in.name,
+                ]
+                try:
+                    subprocess.run(cmd, check=True)
+                    with open(tmp_out.name, "rb") as f:
+                        st.download_button(
+                            "📥 Download Compressed PDF",
+                            f.read(),
+                            "compressed.pdf",
+                            "application/pdf",
+                        )
+                    st.success("✅ Compression successful via Ghostscript.")
+                    return
+                except Exception as e:
+                    st.warning(f"⚠️ Processing...")
 
-            output_buffer.seek(0)
-            st.download_button("📥 Download Compressed PDF", output_buffer, "compressed_fallback.pdf", "application/pdf")
-            st.success("✅ Fallback compression done successfully.")
+            # --- Fallback: Python-only rebuild ---
+            try:
+                st.warning("⚙️ Processing...")
+                pdf = pdfium.PdfDocument(tmp_in.name)
+                output_buffer = io.BytesIO()
+                c = canvas.Canvas(output_buffer)
+
+                for i, page in enumerate(pdf):
+                    pil_image = page.render(scale=scale).to_pil()
+
+                    # Compress image
+                    img_bytes = io.BytesIO()
+                    pil_image.save(img_bytes, format="JPEG", quality=quality)
+                    img_bytes.seek(0)
+
+                    # Draw compressed image full-page
+                    w, h = page.get_width(), page.get_height()
+                    c.setPageSize((w, h))
+                    c.drawImage(ImageReader(img_bytes), 0, 0, width=w, height=h)
+                    c.showPage()
+
+                c.save()
+                pdf.close()
+
+                output_buffer.seek(0)
+                st.download_button(
+                    "📥 Download Compressed PDF",
+                    output_buffer.getvalue(),
+                    "compressed_fallback.pdf",
+                    "application/pdf",
+                )
+                st.success("✅ Fallback compression done successfully.")
+            except Exception as e:
+                if "encrypted" in str(e).lower():
+                    st.error(f"🔒 The file **{file.name}** is encrypted — cannot compress it.")
+                else:
+                    st.error(f"❌ Compression failed: {e}")
+
+        except FileNotDecryptedError:
+            st.error(f"🔒 The file **{file.name}** is encrypted — cannot compress it.")
         except Exception as e:
-            st.error(f"❌ Compression failed: {e}")
+            st.error(f"❌ Error reading file: {e}")
+
 
 
 with tabs[0]:
