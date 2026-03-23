@@ -883,6 +883,13 @@ def run_watermark_tool():
                 elif st.session_state.sec_user_pw == st.session_state.sec_owner_pw:
                     st.warning("User and Owner passwords must be different.")
 
+        st.markdown("---")
+        st.subheader("📤 Export Options")
+        import os
+        if "export_path" not in st.session_state:
+            st.session_state.export_path = os.path.join(os.path.expanduser("~"), "Downloads", "stamped_output.pdf")
+        st.text_input("Local Save Path (Absolute path to save directly to disk)", key="export_path")
+
         # Apply button (explicit action, visible regardless of stamps)
         apply_now = st.button("✅ Apply Stamp(s) to PDF", use_container_width=True, key="apply_btn")
 
@@ -1040,8 +1047,26 @@ def run_watermark_tool():
                     out_path = tmp.name
 
             with open(out_path, "rb") as f:
-                fname = "stamped_secure.pdf" if st.session_state.sec_enabled else "stamped_output.pdf"
-                st.download_button("📥 Download stamped PDF", f, file_name=fname, mime="application/pdf")
+                pdf_data = f.read()
+                
+            # Save directly to local path
+            try:
+                import os
+                save_path = str(st.session_state.export_path)
+                if save_path and save_path.strip():
+                    if os.path.isdir(save_path):
+                        save_path = os.path.join(save_path, "stamped_output.pdf")
+                    out_dir = os.path.dirname(save_path)
+                    if out_dir:
+                        os.makedirs(out_dir, exist_ok=True)
+                    with open(save_path, "wb") as out_pdf:
+                        out_pdf.write(pdf_data)
+                    st.success(f"✅ PDF successfully saved directly to: {save_path}")
+            except Exception as e:
+                st.error(f"❌ Failed to save to local path: {e}")
+                
+            fname = "stamped_secure.pdf" if st.session_state.sec_enabled else "stamped_output.pdf"
+            st.download_button("📥 Download stamped PDF via Browser", pdf_data, file_name=fname, mime="application/pdf")
             if st.session_state.sec_enabled:
                 st.success("✅ Done! Stamps applied and PDF encrypted.")
             else:
