@@ -1,9 +1,14 @@
 [browser]
 gatherUsageStats = false
+serverAddress = "stamp.sophal.net"
+serverPort = 443
 
 [server]
+address = "0.0.0.0"
+headless = true
 enableCORS = false
 enableXsrfProtection = false
+maxUploadSize = 500
 
 [ui]
 hideTopBar = true

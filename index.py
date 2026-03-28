@@ -9,32 +9,30 @@
 import io
 import json
 import base64
+import os
 import tempfile
+import subprocess
+import datetime
+import copy
+import uuid
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+import database as db
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
-from PyPDF2 import PdfReader, PdfWriter ,errors
+from PyPDF2 import PdfReader, PdfWriter, PdfMerger
+from PyPDF2.errors import FileNotDecryptedError
 from reportlab.pdfgen import canvas as rl_canvas
+from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
 from reportlab.lib.colors import HexColor
 from reportlab.lib.utils import ImageReader, simpleSplit
 import pypdfium2 as pdfium
 import streamlit.components.v1 as components
-from PyPDF2.errors import FileNotDecryptedError
-from PyPDF2 import PdfMerger
-import pypdfium2 as pdfium
-from PIL import Image
-from reportlab.pdfgen import canvas
-import io
-import tempfile
-import subprocess
-from PyPDF2 import PdfReader
-from PyPDF2.errors import FileNotDecryptedError
-from reportlab.pdfgen import canvas
-from reportlab.lib.utils import ImageReader
-import streamlit as st
+
+# --- INITIALIZE STREAMLIT ---
+st.set_page_config(page_title="Advanced PDF Watermark Tool", layout="wide")
 
 hide_st_style = """
     <style>
@@ -65,37 +63,52 @@ tabs = st.tabs([
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 🔐 Access Control — Only authorized users can open the app
-AUTHORIZED_USERS = {
-    # username_or_email : password
-    "bachir.souldi": "admin123",
-    "dr.mouna": "medic2025",
-    "manager.erp": "sophalsecure",
-}
 
 def login_screen():
     st.title("🔐 Access Restricted")
     st.write("This application is private. Please log in to continue.")
-    user = st.selectbox("Select your username", list(AUTHORIZED_USERS.keys()))
+    user = st.text_input("Username")
     pw = st.text_input("Password", type="password")
     col1, col2 = st.columns([0.7, 0.3])
     with col2:
         if st.button("Login", use_container_width=True):
-            if AUTHORIZED_USERS.get(user) == pw:
+            if db.authenticate_user(user, pw):
                 st.session_state.authenticated = True
                 st.session_state.current_user = user
+                # Create and save token in query params so it survives refreshes
+                token = db.create_session(user)
+                st.query_params["session"] = token
+                
                 st.success(f"Welcome, {user}! ✅")
                 st.rerun()
             else:
-                st.error("❌ Incorrect password. Access denied.")
+                st.error("❌ Incorrect username or password. Access denied.")
 
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
     st.session_state.current_user = None
+    
+    # Auto-login if valid session token is in URL
+    if "session" in st.query_params:
+        session_token = st.query_params["session"]
+        username = db.get_user_by_session(session_token)
+        if username:
+            st.session_state.authenticated = True
+            st.session_state.current_user = username
 
 # Show login form if not authenticated
 if not st.session_state.authenticated:
     login_screen()
     st.stop()
+
+def get_page_size_pt(page) -> Tuple[float, float]:
+    """Get actual width and height of a PDF page, taking rotation into account."""
+    mb = page.mediabox
+    w, h = float(mb.width), float(mb.height)
+    # If the page is rotated by 90 or 270 degrees, swap width and height
+    if page.get('/Rotate', 0) in [90, 270]:
+        return h, w
+    return w, h
 
 def run_watermark_tool():
     # ─────────────────────────────────────────────────────────────────────────────
@@ -105,14 +118,21 @@ def run_watermark_tool():
         st.caption(f"👋 Logged in as: **{st.session_state.current_user}**")
     with col2:
         if st.button("🚪 Logout", use_container_width=True):
+            user = st.session_state.current_user
+            if user:
+                db.set_setting(user, "session_token", "") # Clear token from DB
+            
             st.session_state.authenticated = False
             st.session_state.current_user = None
+            if "session" in st.query_params:
+                del st.query_params["session"]
+                
             st.rerun()
 
 
     # ─────────────────────────────────────────────────────────────────────────────
     # App config / constants
-    st.set_page_config(page_title="Advanced PDF Watermark Tool", layout="wide")
+    # (Page config already set at top level)
     PT_PER_MM = mm
     PREVIEW_LIMIT = 10  # limit preview pages for performance
 
@@ -134,6 +154,36 @@ def run_watermark_tool():
         if stroke_alpha is not None:
             try: can.setStrokeAlpha(stroke_alpha)
             except Exception: pass
+
+    def get_subdirectories(path: str) -> List[str]:
+        try:
+            p = os.path.normpath(os.path.expanduser(path))
+            if not os.path.isdir(p):
+                return []
+            return [d for d in os.listdir(p) if os.path.isdir(os.path.join(p, d))]
+        except Exception:
+            return []
+
+    def folder_picker_ui(key_prefix: str, current_path: str):
+        """Simple server-side folder picker within Streamlit."""
+        st.write(f"📂 **Browsing:** `{current_path}`")
+        
+        # Navigation
+        parent = os.path.dirname(current_path)
+        col_nav1, col_nav2 = st.columns([0.3, 0.7])
+        with col_nav1:
+            if st.button("⬅ Parent", key=f"{key_prefix}_up"):
+                return parent
+        
+        subdirs = get_subdirectories(current_path)
+        if not subdirs:
+            st.caption("No subdirectories found.")
+        else:
+            selected_sub = st.selectbox("Subdirectories", ["-- Select to enter --"] + sorted(subdirs), key=f"{key_prefix}_select")
+            if selected_sub != "-- Select to enter --":
+                return os.path.join(current_path, selected_sub)
+        
+        return current_path
 
     # ─────────────────────────────────────────────────────────────────────────────
     # Optimization helpers
@@ -224,53 +274,75 @@ def run_watermark_tool():
 
     # ─────────────────────────────────────────────────────────────────────────────
     # Sidebar — Upload PDF + Add New Stamp
-    with st.sidebar:
-        st.header("PDF Upload")
-        pdf_file = st.file_uploader("Upload PDF", type=["pdf"], key="watermark_upload")
-        render_scale = st.slider("Preview quality / scale", 1.0, 3.0, 1.8, 0.1)
+    num_pages = 0
+    page_w_pt, page_h_pt = (595.276, 841.89)
 
-        num_pages = 0
-        page_w_pt, page_h_pt = (595.276, 841.89)
+    with st.sidebar:
+        st.header("📄 PDF Input")
+        pdf_file = st.file_uploader("Upload PDF File", type=["pdf"], key="watermark_upload")
+        
+        # New: Auto-generate filename logic
+        if pdf_file is not None:
+            if "last_uploaded_name" not in ss or ss.last_uploaded_name != pdf_file.name:
+                base_name = os.path.splitext(pdf_file.name)[0]
+                ss.custom_filename = f"{base_name}_stamped.pdf"
+                ss.last_uploaded_name = pdf_file.name
+        else:
+            if "last_uploaded_name" in ss:
+                ss.custom_filename = "stamped_output.pdf"
+                del ss.last_uploaded_name
+
+        render_scale = st.slider("Preview quality / scale", 1.0, 3.0, 1.8, 0.1)
 
         if pdf_file:
             ss.pdf_bytes = pdf_file.read()
             try:
                 probe = PdfReader(io.BytesIO(ss.pdf_bytes))
                 num_pages = len(probe.pages)
-                mb = probe.pages[0].mediabox
-                page_w_pt, page_h_pt = float(mb.width), float(mb.height)
+                page_w_pt, page_h_pt = get_page_size_pt(probe.pages[0])
             except Exception:
                 st.error("Failed to read PDF (maybe encrypted).")
 
         st.markdown("---")
         st.header("Add New Stamp")
 
-        auto_sign = st.checkbox("Add automatic digital signature", False)
+        if "auto_sign" not in ss: ss.auto_sign = False
+        ss.auto_sign = st.checkbox("Add automatic digital signature", value=ss.auto_sign)
 
-        if auto_sign:
-            default_x = 145.0
-            default_y = 10.0
+        if ss.auto_sign:
+            w_mm_page = page_w_pt / mm
+            h_mm_page = page_h_pt / mm
+            
             default_w = 60.0
             default_h = 20.0
+            default_padding = 5.0
+            
+            default_x = w_mm_page - default_w - default_padding
+            default_y = default_padding
 
             use_default_pos = st.checkbox("Use default position (bottom-right corner)", True)
 
             if not use_default_pos:
-                default_x = st.number_input("X (mm)", 0.0, 5000.0, 180.0)
-                default_y = st.number_input("Y (mm)", 0.0, 5000.0, 15.0)
-                default_w = st.number_input("Width (mm)", 5.0, 5000.0, 60.0)
-                default_h = st.number_input("Height (mm)", 5.0, 5000.0, 20.0)
+                default_x = st.number_input("X (mm)", 0.0, 5000.0, default_x)
+                default_y = st.number_input("Y (mm)", 0.0, 5000.0, default_y)
+                default_w = st.number_input("Width (mm)", 5.0, 5000.0, default_w)
+                default_h = st.number_input("Height (mm)", 5.0, 5000.0, default_h)
 
             username = st.session_state.current_user or "Unknown User"
-            default_sig_action = "Digitally signed"
+            db_sig_action = db.get_setting(username, "default_sig_action", "Digitally signed")
             
-            sig_action = st.text_area("Signature Action (User and Date are added automatically)", value=default_sig_action, height=60)
+            sig_action_val = st.text_area("Signature Action (User and Date are added automatically)", value=db_sig_action, height=60)
+            if sig_action_val != db_sig_action:
+                db.set_setting(username, "default_sig_action", sig_action_val)
+            sig_action = sig_action_val
+            
+            sig_opacity = st.slider("Signature Background Transparency", 0.0, 1.0, 0.0, 0.05, 
+                                    help="0.0 = Solid background, 1.0 = Transparent background")
 
             if st.button("🖋 Add Digital Signature Stamp"):
                 if not sig_action.strip():
                     st.error("Signature action cannot be empty!")
                 else:
-                    import datetime
                     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     final_sig_text = f"{sig_action.strip()} by {username}\nDate: {now_str}"
                     
@@ -291,7 +363,7 @@ def run_watermark_tool():
                             rect_fill_hex="#FFFFFF",
                             rect_border_hex="#000000",
                             text_color_hex="#000000",
-                            rect_opacity=0.0,
+                            rect_opacity=sig_opacity,
                             border_width_pt=0.5,
                             padding_mm=2.0,
                             tiled=False
@@ -423,9 +495,10 @@ def run_watermark_tool():
             pdf.close()
             return [], (595.276, 841.89)
 
+        # For preview size, we use the first page (consistent with the rest of the UI)
         first = pdf.get_page(0)
-        page_w_pt = first.get_width()
-        page_h_pt = first.get_height()
+        # pdfium handles rotation automatically in rendered dimensions
+        page_w_pt, page_h_pt = first.get_size()
         first.close()
 
         images = []
@@ -735,7 +808,6 @@ def run_watermark_tool():
                 st.rerun()
 
             if dup:
-                import copy
                 stamps = st.session_state.stamps
                 clone = copy.deepcopy(stamps[selected])
                 stamps.insert(selected+1, clone)
@@ -884,14 +956,95 @@ def run_watermark_tool():
                     st.warning("User and Owner passwords must be different.")
 
         st.markdown("---")
-        st.subheader("📤 Export Options")
-        import os
-        if "export_path" not in st.session_state:
-            st.session_state.export_path = os.path.join(os.path.expanduser("~"), "Downloads", "stamped_output.pdf")
-        st.text_input("Local Save Path (Absolute path to save directly to disk)", key="export_path")
+        st.header("📤 Export Options")
+        username = st.session_state.get("current_user", "Unknown")
+        default_dl = os.path.join(os.path.expanduser("~"), "Downloads", "stamped_output.pdf")
+        
+        db_export_path = db.get_setting(username, "export_path", default_dl)
+        
+        if "export_path_input" not in st.session_state:
+            st.session_state.export_path_input = db_export_path
+
+        if "show_browse_primary" not in ss: ss.show_browse_primary = False
+        if ss.show_browse_primary:
+            with st.container(border=True):
+                new_path = folder_picker_ui("prim", st.session_state.export_path_input)
+                if new_path != st.session_state.export_path_input:
+                    st.session_state.export_path_input = new_path
+                    st.rerun()
+                if st.button("Close Browser", key="close_prim"):
+                    ss.show_browse_primary = False
+                    st.rerun()
+            
+        c_path, c_browse, c_save = st.columns([0.6, 0.2, 0.2])
+        with c_path:
+            export_path_val = st.text_input("Local Save Directory", key="export_path_input")
+        
+        with c_browse:
+            # New: Custom Filename field (defaulting to the auto-generated one)
+            c_default = ss.get("custom_filename", "stamped_output.pdf")
+            custom_filename = st.text_input("Export Filename", value=c_default, key="custom_filename_input")
+            
+            # Clean up the filename
+            if custom_filename and not custom_filename.lower().endswith(".pdf"):
+                custom_filename += ".pdf"
+            ss.custom_filename = custom_filename
+            
+            st.write("") # Padding for alignment
+            if st.button("📂 Browse", use_container_width=True, key="browse_prim_btn"):
+                ss.show_browse_primary = not ss.show_browse_primary
+                st.rerun()
+                    
+        with c_save:
+            st.write("")
+            st.write("")
+            if st.button("💾 Save to DB", use_container_width=True, key="save_primary"):
+                db.set_setting(username, "export_path", export_path_val)
+                st.success("Default path saved!")
+                
+        st.session_state.export_path = export_path_val
+
+        db_ro_export_path = db.get_setting(username, "ro_export_path", "")
+        
+        if "ro_export_path_input" not in st.session_state:
+            st.session_state.ro_export_path_input = db_ro_export_path
+
+        if "show_browse_ro" not in ss: ss.show_browse_ro = False
+        if ss.show_browse_ro:
+            # Default to primary if empty
+            base_ro = st.session_state.ro_export_path_input or st.session_state.export_path_input or os.path.expanduser("~")
+            with st.container(border=True):
+                new_path_ro = folder_picker_ui("ro_p", base_ro)
+                if new_path_ro != base_ro:
+                    st.session_state.ro_export_path_input = new_path_ro
+                    st.rerun()
+                if st.button("Close Browser", key="close_ro"):
+                    ss.show_browse_ro = False
+                    st.rerun()
+            
+        c_ro_path, c_ro_browse, c_ro_save = st.columns([0.6, 0.2, 0.2])
+        with c_ro_path:
+            ro_export_path_val = st.text_input("Read-Only Save Directory (Optional)", key="ro_export_path_input")
+        
+        with c_ro_browse:
+            st.write("") # Padding for alignment
+            st.write("")
+            if st.button("📂 Browse", key="ro_browse_btn", use_container_width=True):
+                ss.show_browse_ro = not ss.show_browse_ro
+                st.rerun()
+            
+        with c_ro_save:
+            st.write("")
+            st.write("")
+            if st.button("💾 Save to DB", key="ro_save", use_container_width=True):
+                db.set_setting(username, "ro_export_path", ro_export_path_val)
+                st.success("Read-Only path saved!")
+                
+        st.session_state.ro_export_path = ro_export_path_val
 
         # Apply button (explicit action, visible regardless of stamps)
-        apply_now = st.button("✅ Apply Stamp(s) to PDF", use_container_width=True, key="apply_btn")
+        btn_label = "🚀 Apply Changes (Stamps / Security / Export)" if ss.stamps else "🚀 Apply Settings (Security / Export)"
+        apply_now = st.button(btn_label, use_container_width=True, key="apply_btn")
 
     # LEFT (CENTER) — Preview with spinner on update
     with main_col:
@@ -949,8 +1102,6 @@ def run_watermark_tool():
     if apply_now:
         if not st.session_state.pdf_bytes:
             st.error("Please upload a PDF.")
-        elif not st.session_state.stamps:
-            st.error("Please add at least one stamp.")
         else:
             # Validate security inputs if enabled
             if st.session_state.sec_enabled:
@@ -961,44 +1112,55 @@ def run_watermark_tool():
                     st.error("User and Owner passwords must be different.")
                     st.stop()
             
-            # START SIGNING
-            username = st.session_state.current_user or "Unknown User"
-            default_x = 145.0
-            default_y = 10.0
-            default_w = 60.0
-            default_h = 20.0
-            import datetime
-            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # Optional Digital Signature (if enabled in sidebar)
+            if ss.get("auto_sign", False):
+                username = st.session_state.current_user or "Unknown User"
+                # use dynamic num_pages if possible
+                np = num_pages if 'num_pages' in locals() and num_pages > 0 else 1
+                
+                # Check if we already have a signature stamp to avoid duplicates
+                has_sig = any("Digitally signed" in s.text for s in ss.stamps if s.stamp_type == "text")
+                if not has_sig:
+                    default_w = 60.0
+                    default_h = 20.0
+                    default_padding = 5.0
+                    
+                    # Estimate based on current page_w_pt (sidebar value)
+                    w_mm_page = (page_w_pt / mm) if 'page_w_pt' in locals() else 210.0
+                    default_x = w_mm_page - default_w - default_padding
+                    default_y = default_padding
+                    
+                    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            sig_text = f"Digitally signed by {username}\nDate: {now}"
+                    sig_text = f"Digitally signed by {username}\nDate: {now}"
 
-            ss.stamps.append(
-                Stamp(
-                    stamp_type="text",
-                    x_mm=default_x,
-                    y_mm=default_y,
-                    w_mm=default_w,
-                    h_mm=default_h,
-                    rotation_deg=0,
-                    page_from=1,
-                    page_to=max(1, num_pages) if num_pages else 1,
-                    text=sig_text,
-                    font_size_pt=10,
-                    bold=False,
-                    italic=False,
-                    rect_fill_hex="#FFFFFF",
-                    rect_border_hex="#000000",
-                    text_color_hex="#000000",
-                    rect_opacity=0.0,
-                    border_width_pt=0.5,
-                    padding_mm=2.0,
-                    tiled=False
-                )
-            )
-            st.success("✅ Digital signature added successfully!")
-            st.session_state.selected_stamp_index = len(ss.stamps) - 1
-            # st.rerun()
-            # END SIGNING SIGNING
+                    ss.stamps.append(
+                        Stamp(
+                            stamp_type="text",
+                            x_mm=default_x,
+                            y_mm=default_y,
+                            w_mm=default_w,
+                            h_mm=default_h,
+                            rotation_deg=0,
+                            page_from=1,
+                            page_to=np,
+                            text=sig_text,
+                            font_size_pt=10,
+                            bold=False,
+                            italic=False,
+                            rect_fill_hex="#FFFFFF",
+                            rect_border_hex="#000000",
+                            text_color_hex="#000000",
+                            rect_opacity=0.0,
+                            border_width_pt=0.5,
+                            padding_mm=2.0,
+                            tiled=False
+                        )
+                    )
+                    st.success("✅ Digital signature added successfully!")
+                    st.session_state.selected_stamp_index = len(ss.stamps) - 1
+            
+            # Start Processing
 
             with st.spinner("Applying stamps to PDF..."):
                 reader = PdfReader(io.BytesIO(st.session_state.pdf_bytes))
@@ -1007,7 +1169,8 @@ def run_watermark_tool():
                 # Add pages + overlays
                 n = len(reader.pages)
                 for i, page in enumerate(reader.pages):
-                    overlay_reader = build_overlay_pdf_for_page(st.session_state.stamps, i, page_w_pt, page_h_pt)
+                    curr_w, curr_h = get_page_size_pt(page)
+                    overlay_reader = build_overlay_pdf_for_page(st.session_state.stamps, i, curr_w, curr_h)
                     if overlay_reader:
                         page.merge_page(overlay_reader.pages[0])
                     writer.add_page(page)
@@ -1051,21 +1214,73 @@ def run_watermark_tool():
                 
             # Save directly to local path
             try:
-                import os
-                save_path = str(st.session_state.export_path)
-                if save_path and save_path.strip():
-                    if os.path.isdir(save_path):
-                        save_path = os.path.join(save_path, "stamped_output.pdf")
-                    out_dir = os.path.dirname(save_path)
-                    if out_dir:
-                        os.makedirs(out_dir, exist_ok=True)
-                    with open(save_path, "wb") as out_pdf:
-                        out_pdf.write(pdf_data)
-                    st.success(f"✅ PDF successfully saved directly to: {save_path}")
+                def safe_save(p_raw, data, default_name):
+                    if not p_raw or not p_raw.strip():
+                        return None
+                    
+                    p = os.path.normpath(os.path.expanduser(p_raw.strip()))
+                    
+                    # If it's a directory, append default filename
+                    if os.path.isdir(p):
+                        p = os.path.join(p, default_name)
+                    
+                    p_dir = os.path.dirname(p)
+                    if p_dir and not os.path.exists(p_dir):
+                        try:
+                            os.makedirs(p_dir, exist_ok=True)
+                        except Exception as e:
+                            if "[WinError 1326]" in str(e):
+                                raise Exception(f"Network Share Access Error: The share '{p_dir}' requires a username and password. Try mapping it to a drive letter (e.g. Z:\\) in Windows first.")
+                            raise Exception(f"Could not create directory '{p_dir}': {e}")
+                    
+                    # Final check for write access to the directory
+                    target_dir = p_dir if p_dir else "."
+                    if not os.access(target_dir, os.W_OK):
+                        raise Exception(f"Access Denied: The directory '{os.path.abspath(target_dir)}' is not writable. Please choose another location.")
+                    
+                    with open(p, "wb") as f_out:
+                        f_out.write(data)
+                    return p
+
+                # 1. Primary Export
+                save_path_raw = st.session_state.get("export_path", "")
+                c_name = st.session_state.get("custom_filename", "stamped_output.pdf")
+                final_path = safe_save(save_path_raw, pdf_data, c_name)
+                if final_path:
+                    st.success(f"✅ PDF successfully saved directly to: {final_path}")
+                    
+                # 2. Read-Only Export (Dynamic encryption)
+                ro_save_path_raw = st.session_state.get("ro_export_path", "")
+                if ro_save_path_raw and ro_save_path_raw.strip():
+                    ro_reader = PdfReader(out_path)
+                    ro_writer = PdfWriter()
+                    for page in ro_reader.pages:
+                        ro_writer.add_page(page)
+                        
+                    ro_permissions = 0xFFFFFFFC # base (-4)
+                    ro_permissions &= ~0b100            # disable printing
+                    ro_permissions &= ~0b10000          # disable modify
+                    ro_permissions &= ~0b100000         # disable copy
+                    ro_permissions &= ~0b1000000        # disable annotations
+                    ro_permissions &= ~0b1000000000     # disable form filling
+                    ro_permissions &= ~0b10000000000    # disable accessibility
+                    if ro_permissions > 0x7FFFFFFF:
+                        ro_permissions -= 0x100000000
+                        
+                    ro_writer.encrypt(user_password="", owner_password=str(uuid.uuid4()), permissions_flag=ro_permissions, use_128bit=True)
+                    
+                    # Write to buffer then save
+                    ro_buf = io.BytesIO()
+                    ro_writer.write(ro_buf)
+                    
+                    ro_name = c_name.replace(".pdf", "_readonly.pdf")
+                    final_ro_path = safe_save(ro_save_path_raw, ro_buf.getvalue(), ro_name)
+                    if final_ro_path:
+                        st.success(f"✅ Read-Only PDF securely locked and saved to: {final_ro_path}")
             except Exception as e:
                 st.error(f"❌ Failed to save to local path: {e}")
                 
-            fname = "stamped_secure.pdf" if st.session_state.sec_enabled else "stamped_output.pdf"
+            fname = st.session_state.get("custom_filename", "stamped_output.pdf")
             st.download_button("📥 Download stamped PDF via Browser", pdf_data, file_name=fname, mime="application/pdf")
             if st.session_state.sec_enabled:
                 st.success("✅ Done! Stamps applied and PDF encrypted.")
@@ -1101,11 +1316,13 @@ def merge_pdf_tool():
             out = io.BytesIO()
             merger.write(out)
             merger.close()
+            c_name = st.session_state.get("custom_filename", "merged.pdf") # Use a default for merge tool if not set
             st.download_button(
-                "📥 Download merged PDF",
-                out.getvalue(),
-                "merged.pdf",
-                "application/pdf",
+                label=f"💾 Download {c_name}",
+                data=out.getvalue(),
+                file_name=c_name,
+                mime="application/pdf",
+                use_container_width=True
             )
             st.success(f"✅ Successfully merged {len(merged_files)} PDF(s).")
 
