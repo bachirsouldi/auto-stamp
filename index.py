@@ -408,15 +408,19 @@ def run_watermark_tool():
             with c1: n_bold = st.checkbox("Bold", True)
             with c2: n_italic = st.checkbox("Italic", False)
             with c3: n_font = st.number_input("Font size (pt)", 8, 200, 28)
-            c4, c5 = st.columns(2)
-            with c4:
-                n_fill = st.color_picker("Rect fill", "#FFFFFF")
-                n_opacity = st.slider("Rect transparency (0→1)", 0.0, 1.0, 0.7, 0.05)
-            with c5:
-                n_border = st.color_picker("Rect border", "#000000")
-                n_bw = st.number_input("Border width (pt)", 0.0, 12.0, 0.0, 0.5)
-            n_text_col = st.color_picker("Text color", "#000000")
-            n_pad = st.number_input("Padding (mm)", 0.0, 50.0, 3.0, 0.5)
+        
+        st.subheader("Box & Style")
+        c4, c5 = st.columns(2)
+        with c4:
+            n_fill = st.color_picker("Rect fill", "#FFFFFF")
+            n_opacity = st.slider("Rect transparency (0→1)", 0.0, 1.0, 0.0, 0.05)
+        with c5:
+            n_border = st.color_picker("Rect border", "#000000")
+            n_bw = st.number_input("Border width (pt)", 0.0, 12.0, 1.0, 0.5)
+        n_text_col = st.color_picker("Text color", "#000000")
+        n_pad = st.number_input("Padding (mm)", 0.0, 50.0, 3.0, 0.5)
+
+        if new_type == "text":
             with st.expander("Tiled watermark (text only)"):
                 n_tiled = st.checkbox("Enable tiled mode", False)
                 n_tile_dx_mm = st.number_input("Tile spacing X (mm)", 10.0, 500.0, 120.0, 1.0)
@@ -652,59 +656,58 @@ def run_watermark_tool():
 
             can.saveState()
 
+            # 1. Coordinate Transform (Rotate around box center)
+            cx, cy = x_pt + w_pt/2, y_pt + h_pt/2
+            can.translate(cx, cy)
+            can.rotate(sp.rotation_deg)
+            can.translate(-w_pt/2, -h_pt/2)
+
+            # 2. Draw Box (Rect + Border) - for both image and text in Box Mode
+            # Tiled mode handles its own background/opacity differently
+            is_tiled = (sp.stamp_type == "text" and sp.tiled)
+            
+            if not is_tiled:
+                alpha = max(0.0, min(1.0, 1.0 - float(sp.rect_opacity)))
+                if alpha > 0:
+                    can.saveState()
+                    ensure_alpha(can, fill_alpha=alpha, stroke_alpha=alpha)
+                    can.setLineWidth(sp.border_width_pt)
+                    can.setStrokeColor(HexColor(sp.rect_border_hex))
+                    can.setFillColor(HexColor(sp.rect_fill_hex))
+                    can.rect(0, 0, w_pt, h_pt, stroke=1, fill=1)
+                    can.restoreState()
+
+            # 3. Draw Content
             if sp.stamp_type == "image" and sp.image_bytes:
-                # Rotate around center of the box for consistency
-                cx = x_pt + w_pt/2
-                cy = y_pt + h_pt/2
-                can.translate(cx, cy)
-                can.rotate(sp.rotation_deg)
-                can.translate(-w_pt/2, -h_pt/2)
                 can.drawImage(ImageReader(io.BytesIO(sp.image_bytes)), 0, 0, width=w_pt, height=h_pt, mask='auto')
 
             elif sp.stamp_type == "text":
                 text_c = HexColor(sp.text_color_hex)
-                can.setFillColor(text_c)
                 font_name = pick_font_name(sp.bold, sp.italic)
                 can.setFont(font_name, float(sp.font_size_pt))
 
                 if sp.tiled:
-                    # Full-page repeat tiles at tile_angle_deg; ignore box rect
-                    dx_pt = mm_to_pt(sp.tile_dx_mm)
-                    dy_pt = mm_to_pt(sp.tile_dy_mm)
-                    angle = sp.tile_angle_deg
-                    # offset grid origin using (x_mm, y_mm)
-                    off_x = mm_to_pt(sp.x_mm)
-                    off_y = mm_to_pt(sp.y_mm)
-
+                    # Tiled mode uses rect_opacity for the text itself
                     alpha = max(0.0, min(1.0, 1.0 - float(sp.rect_opacity)))
+                    dx_pt, dy_pt = mm_to_pt(sp.tile_dx_mm), mm_to_pt(sp.tile_dy_mm)
+                    # For tiled mode, we need to undo the box translation/rotation for full page
+                    can.restoreState() # Pop the box transform
+                    can.saveState()    # Fresh state for tiling
+                    
+                    off_x, off_y = mm_to_pt(sp.x_mm), mm_to_pt(sp.y_mm)
                     for y in range(-int(page_h_pt), int(page_h_pt*2), int(max(6, dy_pt))):
                         for x in range(-int(page_w_pt), int(page_w_pt*2), int(max(6, dx_pt))):
                             can.saveState()
                             can.translate(x + off_x, y + off_y)
-                            can.rotate(angle)
+                            can.rotate(sp.tile_angle_deg)
                             ensure_alpha(can, fill_alpha=alpha, stroke_alpha=alpha)
+                            can.setFillColor(text_c)
                             can.drawString(0, 0, sp.text or "")
                             can.restoreState()
-
                 else:
-                    # BOX MODE: draw rect + border + centered text inside the box (with rotation)
-                    cx = x_pt + w_pt/2
-                    cy = y_pt + h_pt/2
-                    can.translate(cx, cy)
-                    can.rotate(sp.rotation_deg)
-                    can.translate(-w_pt/2, -h_pt/2)
-
-                    fill = HexColor(sp.rect_fill_hex)
-                    border = HexColor(sp.rect_border_hex)
-                    can.setLineWidth(sp.border_width_pt)
-                    can.setStrokeColor(border)
-                    can.setFillColor(fill)
-                    alpha = max(0.0, min(1.0, 1.0 - float(sp.rect_opacity)))
-                    ensure_alpha(can, fill_alpha=alpha, stroke_alpha=alpha)
-                    can.rect(0, 0, w_pt, h_pt, stroke=1, fill=1)
-
                     # Center text within padded box
                     can.setFillColor(text_c)
+                    ensure_alpha(can, fill_alpha=1.0)
                     pad = mm_to_pt(sp.padding_mm)
                     box_w, box_h = max(0.0, w_pt - 2*pad), max(0.0, h_pt - 2*pad)
                     lines = simpleSplit(sp.text or "", font_name, float(sp.font_size_pt), box_w)
@@ -717,6 +720,8 @@ def run_watermark_tool():
                         ty = start_y + leading * (len(lines) - 1 - i)
                         if ty < pad: break
                         can.drawString(tx, ty, line)
+
+            can.restoreState()
 
             can.restoreState()
 
