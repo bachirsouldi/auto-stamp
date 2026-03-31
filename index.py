@@ -48,21 +48,24 @@ st.markdown(hide_st_style, unsafe_allow_html=True)
 
 
 
-tabs = st.tabs([
-    "🪶 Watermark / Stamp",
-    "🔗 Merge PDFs",
-    "✂️ Split PDF",
-    "📄 Extract Pages",
-    "🔍 Extract Text",
-    "🖼 Convert to Images",
-    "📦 Compress PDF"
-])
-
-
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # 🔐 Access Control — Only authorized users can open the app
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+    st.session_state.current_user = None
+    st.session_state.is_admin = False
+    
+    # Auto-login if valid session token is in URL
+    if "session" in st.query_params:
+        session_token = st.query_params["session"]
+        username = db.get_user_by_session(session_token)
+        if username:
+            st.session_state.authenticated = True
+            st.session_state.current_user = username
+            user_rec = db.get_user_by_username(username)
+            if user_rec:
+                st.session_state.is_admin = bool(user_rec['is_admin'])
 
 def login_screen():
     st.title("🔐 Access Restricted")
@@ -72,9 +75,11 @@ def login_screen():
     col1, col2 = st.columns([0.7, 0.3])
     with col2:
         if st.button("Login", use_container_width=True):
-            if db.authenticate_user(user, pw):
+            user_record = db.authenticate_user(user, pw)
+            if user_record:
                 st.session_state.authenticated = True
                 st.session_state.current_user = user
+                st.session_state.is_admin = bool(user_record['is_admin'])
                 # Create and save token in query params so it survives refreshes
                 token = db.create_session(user)
                 st.query_params["session"] = token
@@ -84,22 +89,28 @@ def login_screen():
             else:
                 st.error("❌ Incorrect username or password. Access denied.")
 
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-    st.session_state.current_user = None
-    
-    # Auto-login if valid session token is in URL
-    if "session" in st.query_params:
-        session_token = st.query_params["session"]
-        username = db.get_user_by_session(session_token)
-        if username:
-            st.session_state.authenticated = True
-            st.session_state.current_user = username
-
 # Show login form if not authenticated
 if not st.session_state.authenticated:
     login_screen()
     st.stop()
+
+# --- Refresh last seen ---
+db.update_last_seen(st.session_state.current_user)
+
+# --- Dynamic Tabs for Authenticated Users ---
+tab_titles = [
+    "🪶 Watermark / Stamp",
+    "🔗 Merge PDFs",
+    "✂️ Split PDF",
+    "📄 Extract Pages",
+    "🔍 Extract Text",
+    "🖼 Convert to Images",
+    "📦 Compress PDF"
+]
+if st.session_state.is_admin:
+    tab_titles.append("🛡️ Admin")
+
+tabs = st.tabs(tab_titles)
 
 def get_page_size_pt(page) -> Tuple[float, float]:
     """Get actual width and height of a PDF page, taking rotation into account."""
@@ -228,6 +239,7 @@ def run_watermark_tool():
         rect_border_hex: str = "#000000"
         text_color_hex: str = "#000000"
         rect_opacity: float = 0.0
+        rect_border_opacity: float = 0.0
         border_width_pt: float = 1.0
         padding_mm: float = 3.0
         tiled: bool = False
@@ -336,8 +348,8 @@ def run_watermark_tool():
                 db.set_setting(username, "default_sig_action", sig_action_val)
             sig_action = sig_action_val
             
-            sig_opacity = st.slider("Signature Background Transparency", 0.0, 1.0, 0.0, 0.05, 
-                                    help="0.0 = Solid background, 1.0 = Transparent background")
+            sig_opacity = st.slider("Box Fill Transparency", 0.0, 1.0, 0.0, 0.05, key="sig_fill_opacity")
+            sig_border_opacity = st.slider("Box Border Transparency", 0.0, 1.0, 0.0, 0.05, key="sig_border_opacity")
 
             if st.button("🖋 Add Digital Signature Stamp"):
                 if not sig_action.strip():
@@ -364,6 +376,7 @@ def run_watermark_tool():
                             rect_border_hex="#000000",
                             text_color_hex="#000000",
                             rect_opacity=sig_opacity,
+                            rect_border_opacity=sig_border_opacity,
                             border_width_pt=0.5,
                             padding_mm=2.0,
                             tiled=False
@@ -391,6 +404,7 @@ def run_watermark_tool():
         n_border = "#000000"
         n_text_col = "#000000"
         n_opacity = 0.0
+        n_border_opacity = 0.0
         n_bw = 1.0
         n_pad = 3.0
         n_tiled = False
@@ -413,9 +427,10 @@ def run_watermark_tool():
         c4, c5 = st.columns(2)
         with c4:
             n_fill = st.color_picker("Rect fill", "#FFFFFF")
-            n_opacity = st.slider("Rect transparency (0→1)", 0.0, 1.0, 0.0, 0.05)
+            n_opacity = st.slider("Rect fill transparency (0→1)", 0.0, 1.0, 0.0, 0.05)
         with c5:
             n_border = st.color_picker("Rect border", "#000000")
+            n_border_opacity = st.slider("Rect border transparency (0→1)", 0.0, 1.0, 0.0, 0.05)
             n_bw = st.number_input("Border width (pt)", 0.0, 12.0, 1.0, 0.5)
         n_text_col = st.color_picker("Text color", "#000000")
         n_pad = st.number_input("Padding (mm)", 0.0, 50.0, 3.0, 0.5)
@@ -440,7 +455,10 @@ def run_watermark_tool():
                         image_bytes=n_img,
                         text=n_text, font_size_pt=n_font, bold=n_bold, italic=n_italic,
                         rect_fill_hex=n_fill, rect_border_hex=n_border, text_color_hex=n_text_col,
-                        rect_opacity=n_opacity, border_width_pt=n_bw, padding_mm=n_pad,
+                        rect_opacity=n_opacity,
+                        rect_border_opacity=n_border_opacity,
+                        border_width_pt=n_bw,
+                        padding_mm=n_pad,
                         tiled=(n_tiled if new_type == "text" else False),
                         tile_dx_mm=n_tile_dx_mm, tile_dy_mm=n_tile_dy_mm, tile_angle_deg=n_tile_angle
                     )
@@ -612,20 +630,26 @@ def run_watermark_tool():
                     # BOX MODE: rectangle + border + centered text + rotation
                     fill_rgb = HexColor(sp.rect_fill_hex).rgb()
                     border_rgb = HexColor(sp.rect_border_hex).rgb()
-                    alpha = int(round(255 * (1.0 - sp.rect_opacity)))
-
-                    # Draw fill
-                    draw.rectangle(
-                        [l, t, r, b],
-                        fill=(int(fill_rgb[0]*255), int(fill_rgb[1]*255), int(fill_rgb[2]*255), alpha)
-                    )
-                    # Border (scaled to pixels)
-                    border_px = max(1, int(round(sp.border_width_pt * px_per_pt_x)))
-                    draw.rectangle(
-                        [l, t, r, b],
-                        outline=(int(border_rgb[0]*255), int(border_rgb[1]*255), int(border_rgb[2]*255), alpha),
-                        width=border_px
-                    )
+                    # Draw fill (transparency)
+                    fill_opacity = float(getattr(sp, "rect_opacity", 0.0))
+                    fill_alpha = int(round(255 * (1.0 - fill_opacity)))
+                    if fill_alpha > 0:
+                        draw.rectangle(
+                            [l, t, r, b],
+                            fill=(int(fill_rgb[0]*255), int(fill_rgb[1]*255), int(fill_rgb[2]*255), fill_alpha)
+                        )
+                    
+                    # Border (opacity)
+                    border_opacity = float(getattr(sp, "rect_border_opacity", 0.0))
+                    border_alpha = int(round(255 * (1.0 - border_opacity)))
+                    border_px = int(round(sp.border_width_pt * px_per_pt_x))
+                    
+                    if border_alpha > 0 and border_px > 0:
+                        draw.rectangle(
+                            [l, t, r, b],
+                            outline=(int(border_rgb[0]*255), int(border_rgb[1]*255), int(border_rgb[2]*255), border_alpha),
+                            width=max(1, border_px)
+                        )
 
                     # Draw text in its own layer, then rotate so border stays crisp
                     text_layer = Image.new("RGBA", page.size, (0,0,0,0))
@@ -667,14 +691,16 @@ def run_watermark_tool():
             is_tiled = (sp.stamp_type == "text" and sp.tiled)
             
             if not is_tiled:
-                alpha = max(0.0, min(1.0, 1.0 - float(sp.rect_opacity)))
-                if alpha > 0:
+                fill_alpha = max(0.0, min(1.0, 1.0 - float(sp.rect_opacity or 0.0)))
+                border_alpha = max(0.0, min(1.0, 1.0 - float(sp.rect_border_opacity or 0.0)))
+                
+                if fill_alpha > 0 or border_alpha > 0:
                     can.saveState()
-                    ensure_alpha(can, fill_alpha=alpha, stroke_alpha=alpha)
+                    ensure_alpha(can, fill_alpha=fill_alpha, stroke_alpha=border_alpha)
                     can.setLineWidth(sp.border_width_pt)
                     can.setStrokeColor(HexColor(sp.rect_border_hex))
                     can.setFillColor(HexColor(sp.rect_fill_hex))
-                    can.rect(0, 0, w_pt, h_pt, stroke=1, fill=1)
+                    can.rect(0, 0, w_pt, h_pt, stroke=(1 if border_alpha > 0 else 0), fill=(1 if fill_alpha > 0 else 0))
                     can.restoreState()
 
             # 3. Draw Content
@@ -721,9 +747,7 @@ def run_watermark_tool():
                         if ty < pad: break
                         can.drawString(tx, ty, line)
 
-            can.restoreState()
-
-            can.restoreState()
+            can.restoreState() # Restore the state saved at the beginning of the loop for this stamp
 
         can.save()
         packet.seek(0)
@@ -872,10 +896,11 @@ def run_watermark_tool():
                     cx4, cx5 = st.columns(2)
                     with cx4:
                         rect_fill_hex = st.color_picker("Rect fill", value=editing.rect_fill_hex, key=f"fill_{sidx}")
-                        rect_opacity = st.slider("Rect transparency (0→1)", 0.0, 1.0, editing.rect_opacity, 0.05, key=f"opc_{sidx}")
+                        rect_opacity = st.slider("Rect fill transparency (0→1)", 0.0, 1.0, float(editing.rect_opacity), 0.05, key=f"opc_{sidx}")
                     with cx5:
                         rect_border_hex = st.color_picker("Rect border", value=editing.rect_border_hex, key=f"bor_{sidx}")
-                        border_width_pt = st.number_input("Border width (pt)", 0.0, 12.0, editing.border_width_pt, 0.5, key=f"bw_{sidx}")
+                        rect_border_opacity = st.slider("Rect border transparency (0→1)", 0.0, 1.0, float(editing.rect_border_opacity), 0.05, key=f"bopc_{sidx}")
+                        border_width_pt = st.number_input("Border width (pt)", 0.0, 12.0, float(editing.border_width_pt), 0.5, key=f"bw_{sidx}")
 
                     text_color_hex = st.color_picker("Text color", value=editing.text_color_hex, key=f"txtc_{sidx}")
                     padding_mm = st.number_input("Padding (mm)", 0.0, 50.0, editing.padding_mm, 0.5, key=f"pad_{sidx}")
@@ -1156,7 +1181,8 @@ def run_watermark_tool():
                             rect_fill_hex="#FFFFFF",
                             rect_border_hex="#000000",
                             text_color_hex="#000000",
-                            rect_opacity=0.0,
+                            rect_opacity=ss.get("sig_fill_opacity", 0.0),
+                            rect_border_opacity=ss.get("sig_border_opacity", 0.0),
                             border_width_pt=0.5,
                             padding_mm=2.0,
                             tiled=False
@@ -1549,6 +1575,35 @@ def compress_pdf_tool():
             st.error(f"❌ Error reading file: {e}")
 
 
+def admin_dashboard_tool():
+    st.header("🛡️ Admin Dashboard")
+    st.subheader("Connected Users")
+    
+    minutes = st.number_input("Last active (minutes)", 1, 1440, 5)
+    active_users = db.get_active_users(minutes)
+    
+    if not active_users:
+        st.info(f"No users active in the last {minutes} minutes.")
+    else:
+        # Create a nice layout for active users
+        st.write(f"Showing **{len(active_users)}** users active in the last {minutes} minutes:")
+        
+        data = []
+        for u in active_users:
+            role = "👑 Admin" if u['is_admin'] else "👤 User"
+            # Format timestamp for better display
+            ts = u['last_seen']
+            data.append({
+                "Username": u['username'],
+                "Role": role,
+                "Last Active (UTC)": ts
+            })
+        st.table(data)
+        
+        if st.button("🔄 Refresh Data"):
+            st.rerun()
+
+
 
 with tabs[0]:
     # 🔹 Your existing Watermark / Stamp logic
@@ -1571,3 +1626,7 @@ with tabs[5]:
 
 with tabs[6]:
     compress_pdf_tool()
+
+if st.session_state.is_admin and len(tabs) > 7:
+    with tabs[7]:
+        admin_dashboard_tool()

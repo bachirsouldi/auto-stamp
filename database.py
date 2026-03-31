@@ -16,9 +16,16 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL,
-            is_admin BOOLEAN NOT NULL CHECK (is_admin IN (0, 1))
+            is_admin BOOLEAN NOT NULL CHECK (is_admin IN (0, 1)),
+            last_seen DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    
+    # Simple migration to add last_seen column if it doesn't exist yet
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN last_seen DATETIME")
+    except sqlite3.OperationalError:
+        pass # Already exists
     
     # Create settings table
     cursor.execute('''
@@ -43,13 +50,48 @@ def init_db():
     conn.close()
 
 def authenticate_user(username, password):
-    """Returns True if the user exists and password matches, False otherwise."""
+    """Returns the user row (dict-like) if authenticated, None otherwise."""
     conn = get_connection()
+    conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
-    cursor.execute("SELECT id FROM users WHERE username = ? AND password = ?", (username, password))
+    cursor.execute("SELECT * FROM users WHERE username = ? AND password = ?", (username, password))
     user = cursor.fetchone()
     conn.close()
-    return user is not None
+    return user
+
+def get_user_by_username(username):
+    """Retrieves a user by their username."""
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
+    user = cursor.fetchone()
+    conn.close()
+    return user
+
+def update_last_seen(username):
+    """Updates the last_seen timestamp for a user."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET last_seen = CURRENT_TIMESTAMP WHERE username = ?", (username,))
+    conn.commit()
+    conn.close()
+
+def get_active_users(minutes=5):
+    """Returns a list of users active within the last X minutes."""
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    # Use strftime to handle SQLite DATETIME comparison
+    cursor.execute("""
+        SELECT username, is_admin, last_seen 
+        FROM users 
+        WHERE last_seen >= datetime('now', '-' || ? || ' minute')
+        ORDER BY last_seen DESC
+    """, (minutes,))
+    users = cursor.fetchall()
+    conn.close()
+    return users
 
 def get_setting(username, key, default=None):
     """Retrieves a setting for a user. Returns default if not found."""
