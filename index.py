@@ -1213,17 +1213,17 @@ def run_watermark_tool():
 
                     # Deny actions based on toggles
                     if st.session_state.sec_disable_print:
-                        permissions &= ~0b100            # disable printing
+                        permissions &= ~((1 << 2) | (1 << 11)) # disable printing and high-res printing
                     if st.session_state.sec_disable_modify:
-                        permissions &= ~0b10000          # disable document modification
+                        permissions &= ~(1 << 3)         # disable document modification
                     if st.session_state.sec_disable_copy:
-                        permissions &= ~0b100000         # disable text copying/extract
+                        permissions &= ~(1 << 4)         # disable text copying/extract
                     if st.session_state.sec_disable_annotate:
-                        permissions &= ~0b1000000        # disable annotations/comments
+                        permissions &= ~(1 << 5)         # disable annotations/comments
                     if st.session_state.sec_disable_formfill:
-                        permissions &= ~0b1000000000     # disable form filling
+                        permissions &= ~(1 << 8)         # disable form filling
                     if st.session_state.sec_disable_accessibility:
-                        permissions &= ~0b10000000000    # disable accessibility extract (e.g. screen readers)
+                        permissions &= ~(1 << 9)         # disable accessibility extract (e.g. screen readers)
 
                     # Ensure value fits signed 32-bit range
                     if permissions > 0x7FFFFFFF:
@@ -1289,12 +1289,12 @@ def run_watermark_tool():
                         ro_writer.add_page(page)
                         
                     ro_permissions = 0xFFFFFFFC # base (-4)
-                    ro_permissions &= ~0b100            # disable printing
-                    ro_permissions &= ~0b10000          # disable modify
-                    ro_permissions &= ~0b100000         # disable copy
-                    ro_permissions &= ~0b1000000        # disable annotations
-                    ro_permissions &= ~0b1000000000     # disable form filling
-                    ro_permissions &= ~0b10000000000    # disable accessibility
+                    ro_permissions &= ~((1 << 2) | (1 << 11)) # disable printing and high-res printing
+                    ro_permissions &= ~(1 << 3)          # disable modify
+                    ro_permissions &= ~(1 << 4)          # disable copy
+                    ro_permissions &= ~(1 << 5)          # disable annotations
+                    ro_permissions &= ~(1 << 8)          # disable form filling
+                    ro_permissions &= ~(1 << 9)          # disable accessibility
                     if ro_permissions > 0x7FFFFFFF:
                         ro_permissions -= 0x100000000
                         
