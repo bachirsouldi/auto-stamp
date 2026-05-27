@@ -3,3 +3,5 @@ pillow
 PyPDF2
 reportlab
 pypdfium2
+pikepdf
+pytesseract
