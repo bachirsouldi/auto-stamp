@@ -20,6 +20,9 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import database as db
+from pathsafe import get_export_roots, get_subdirectories, resolve_export_path
+import sop
+import glpi
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont, ImageChops, ImageEnhance
 import difflib
@@ -121,35 +124,51 @@ def _render_protected_pdf(pdf_bytes: bytes):
 
     protected_html = f"""
 <style>
-  html, body {{ margin: 0; padding: 0; background: #0e1117; font-family: sans-serif; }}
+  html, body {{ margin: 0; padding: 0; background: #0e1117; font-family: sans-serif; overflow: hidden; }}
+
+  /* Scrollable viewport for the page image */
+  #viewer {{
+    overflow: auto;
+    background: #0e1117;
+    cursor: default;
+  }}
+  #viewer.can-pan  {{ cursor: grab; }}
+  #viewer.panning  {{ cursor: grabbing !important; touch-action: none; }}
 
   .wrap {{
     position: relative;
     user-select: none; -webkit-user-select: none; -moz-user-select: none;
     line-height: 0;
+    /* width is set by JS to containerW * zoom */
   }}
   .wrap img {{
     width: 100%; display: block;
     -webkit-user-drag: none; user-drag: none; pointer-events: none;
   }}
   .overlay {{ position: absolute; inset: 0; background: transparent; z-index: 10; }}
+  /* When zoomed, let pointer events pass through the overlay to the viewer for panning */
+  #viewer.can-pan  .overlay {{ pointer-events: none; }}
+  #viewer.panning  .overlay {{ pointer-events: none; }}
 
-  /* Navigation bar */
-  .nav {{
+  /* Toolbar: nav + zoom */
+  .toolbar {{
     display: flex; align-items: center; justify-content: center;
-    gap: 10px; padding: 8px 0; background: #0e1117;
+    gap: 8px; padding: 6px 4px; background: #0e1117;
+    flex-wrap: nowrap;
   }}
-  .nav button {{
+  .toolbar button {{
     background: rgba(40,40,55,0.9); color: #ddd;
     border: 1px solid #555; border-radius: 6px;
-    padding: 5px 16px; cursor: pointer; font-size: 14px;
-    transition: background 0.15s;
+    padding: 4px 13px; cursor: pointer; font-size: 14px;
+    transition: background 0.15s; white-space: nowrap;
   }}
-  .nav button:hover {{ background: rgba(70,70,100,0.95); }}
-  .nav button:disabled {{ opacity: 0.3; cursor: default; }}
-  .nav .pageinfo {{ color: #aaa; font-size: 13px; min-width: 90px; text-align: center; }}
+  .toolbar button:hover  {{ background: rgba(70,70,100,0.95); }}
+  .toolbar button:disabled {{ opacity: 0.3; cursor: default; }}
+  .toolbar .sep      {{ width: 1px; height: 20px; background: #444; flex-shrink: 0; }}
+  .toolbar .pageinfo {{ color: #aaa; font-size: 13px; min-width: 85px; text-align: center; }}
+  .toolbar .zoominfo {{ color: #aaa; font-size: 13px; min-width: 46px; text-align: center; }}
 
-  /* Fullscreen toggle */
+  /* Fullscreen button */
   #fs-btn {{
     position: fixed; bottom: 14px; right: 14px; z-index: 999;
     background: rgba(30,30,40,0.85); color: #ddd;
@@ -161,75 +180,192 @@ def _render_protected_pdf(pdf_bytes: bytes):
 
   /* Fullscreen overrides */
   :fullscreen body, :-webkit-full-screen body {{
-    display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+    display: flex; flex-direction: column; height: 100vh;
   }}
-  :fullscreen .wrap, :-webkit-full-screen .wrap {{
-    flex: 1; display: flex; align-items: center; justify-content: center;
-    overflow: hidden;
+  :fullscreen #viewer, :-webkit-full-screen #viewer {{
+    flex: 1; overflow: auto;
   }}
-  :fullscreen .wrap img, :-webkit-full-screen .wrap img {{
-    width: auto; max-width: 100vw;
-    max-height: calc(100vh - 56px);
-    object-fit: contain;
-  }}
-  :fullscreen .overlay, :-webkit-full-screen .overlay {{ position: fixed; inset: 0; }}
-  :fullscreen .nav, :-webkit-full-screen .nav {{
+  :fullscreen .overlay, :-webkit-full-screen .overlay {{ position: fixed; inset: 0; z-index: 5; }}
+  :fullscreen .toolbar, :-webkit-full-screen .toolbar {{
     flex-shrink: 0; background: rgba(14,17,23,0.92); width: 100%;
+    position: relative; z-index: 20;
   }}
 </style>
 
-<div class="wrap">
-  <img id="pdfimg" src="" draggable="false" />
-  <div class="overlay" oncontextmenu="return false;"></div>
+<div id="viewer">
+  <div class="wrap" id="wrap">
+    <img id="pdfimg" src="" draggable="false" />
+    <div class="overlay" oncontextmenu="return false;"></div>
+  </div>
 </div>
-<div class="nav">
+<div class="toolbar">
   <button id="prev-btn">&#9664; Prev</button>
   <span class="pageinfo" id="pageinfo"></span>
   <button id="next-btn">Next &#9654;</button>
+  <div class="sep"></div>
+  <button id="zoom-out-btn" title="Zoom out (Ctrl+-)">&#x2212;</button>
+  <span class="zoominfo" id="zoominfo">100%</span>
+  <button id="zoom-in-btn"  title="Zoom in (Ctrl++)">&#x2B;</button>
+  <button id="zoom-reset-btn" title="Reset zoom (Ctrl+0)" style="font-size:12px;padding:4px 8px;">1:1</button>
 </div>
 <button id="fs-btn">&#x26F6; Full Screen</button>
 
 <script>
-  var PAGES = {pages_js};
-  var IMG_W = {img_w}, IMG_H = {img_h};
-  var cur = 0;
+  var PAGES   = {pages_js};
+  var IMG_W   = {img_w}, IMG_H = {img_h};
+  var cur     = 0;
+  var zoom    = 1.0;
+  var MIN_ZOOM = 0.5, MAX_ZOOM = 4.0, ZOOM_STEP = 0.25;
+  var TOOLBAR_H = 46;
 
-  var img     = document.getElementById('pdfimg');
-  var prevBtn = document.getElementById('prev-btn');
-  var nextBtn = document.getElementById('next-btn');
-  var info    = document.getElementById('pageinfo');
-  var fsBtn   = document.getElementById('fs-btn');
+  var viewer      = document.getElementById('viewer');
+  var wrap        = document.getElementById('wrap');
+  var img         = document.getElementById('pdfimg');
+  var prevBtn     = document.getElementById('prev-btn');
+  var nextBtn     = document.getElementById('next-btn');
+  var info        = document.getElementById('pageinfo');
+  var zoomInfo    = document.getElementById('zoominfo');
+  var zoomInBtn   = document.getElementById('zoom-in-btn');
+  var zoomOutBtn  = document.getElementById('zoom-out-btn');
+  var zoomReset   = document.getElementById('zoom-reset-btn');
+  var fsBtn       = document.getElementById('fs-btn');
 
+  /* ── Height & layout ───────────────────────────────── */
+  function containerW() {{
+    return document.documentElement.offsetWidth || 800;
+  }}
+
+  function sendHeight() {{
+    if (document.fullscreenElement || document.webkitFullscreenElement) return;
+    var cw      = containerW();
+    var fullImgH = Math.round(IMG_H * cw / IMG_W);      /* height at zoom=1 */
+    var viewH;
+    if (zoom <= 1) {{
+      viewH = Math.round(fullImgH * zoom);              /* shrinks or stays */
+    }} else {{
+      /* Cap so the iframe doesn't grow beyond ~90% of viewport */
+      viewH = Math.min(Math.round(fullImgH * zoom), Math.round(window.innerHeight * 0.9));
+    }}
+    viewer.style.height = viewH + 'px';
+    var total = viewH + TOOLBAR_H + 10;
+    window.parent.postMessage({{type: 'streamlit:setFrameHeight', height: total}}, '*');
+  }}
+
+  /* ── Zoom ──────────────────────────────────────────── */
+  function applyZoom(pivotX, pivotY) {{
+    var oldW = wrap.offsetWidth  || containerW();
+    var oldH = wrap.offsetHeight || Math.round(IMG_H * containerW() / IMG_W);
+    var sl   = viewer.scrollLeft;
+    var st   = viewer.scrollTop;
+
+    var newW = Math.round(containerW() * zoom);
+    wrap.style.width = newW + 'px';
+
+    zoomInfo.textContent   = Math.round(zoom * 100) + '%';
+    zoomOutBtn.disabled    = (zoom <= MIN_ZOOM);
+    zoomInBtn.disabled     = (zoom >= MAX_ZOOM);
+    viewer.classList.toggle('can-pan', zoom > 1);
+
+    /* Shift scroll so the pixel under the cursor stays fixed */
+    if (pivotX !== undefined && oldW > 0) {{
+      var newW2 = wrap.offsetWidth;
+      var newH2 = wrap.offsetHeight;
+      viewer.scrollLeft = (sl + pivotX) * newW2 / oldW - pivotX;
+      viewer.scrollTop  = (st + pivotY) * newH2 / oldH - pivotY;
+    }}
+
+    sendHeight();
+  }}
+
+  function setZoom(z, pivotX, pivotY) {{
+    zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, z));
+    applyZoom(pivotX, pivotY);
+  }}
+
+  zoomInBtn.addEventListener('click',  function() {{ setZoom(zoom + ZOOM_STEP); }});
+  zoomOutBtn.addEventListener('click', function() {{ setZoom(zoom - ZOOM_STEP); }});
+  zoomReset.addEventListener('click',  function() {{
+    zoom = 1.0;
+    viewer.scrollLeft = 0; viewer.scrollTop = 0;
+    applyZoom();
+  }});
+
+  /* Ctrl + mouse-wheel zoom */
+  viewer.addEventListener('wheel', function(e) {{
+    if (e.ctrlKey || e.metaKey) {{
+      e.preventDefault();
+      var rect = viewer.getBoundingClientRect();
+      var px = e.clientX - rect.left;
+      var py = e.clientY - rect.top;
+      setZoom(zoom + (e.deltaY < 0 ? ZOOM_STEP : -ZOOM_STEP), px, py);
+    }}
+  }}, {{passive: false}});
+
+  /* ── Pointer-capture drag pan ──────────────────────── */
+  /* setPointerCapture keeps tracking even when the cursor leaves the iframe */
+  var drag = {{active: false, x: 0, y: 0, sl: 0, st: 0}};
+
+  viewer.addEventListener('pointerdown', function(e) {{
+    if (zoom <= 1 || e.button !== 0) return;
+    /* Skip if the click landed on the scrollbar track (outside client area) */
+    var rect = viewer.getBoundingClientRect();
+    if ((e.clientX - rect.left) > viewer.clientWidth) return;
+    if ((e.clientY - rect.top)  > viewer.clientHeight) return;
+    drag.active = true;
+    drag.x  = e.clientX; drag.y  = e.clientY;
+    drag.sl = viewer.scrollLeft; drag.st = viewer.scrollTop;
+    viewer.setPointerCapture(e.pointerId);
+    viewer.classList.add('panning');
+    e.preventDefault();
+  }});
+
+  viewer.addEventListener('pointermove', function(e) {{
+    if (!drag.active) return;
+    viewer.scrollLeft = drag.sl - (e.clientX - drag.x);
+    viewer.scrollTop  = drag.st - (e.clientY - drag.y);
+  }});
+
+  viewer.addEventListener('pointerup', function(e) {{
+    if (!drag.active) return;
+    drag.active = false;
+    viewer.releasePointerCapture(e.pointerId);
+    viewer.classList.remove('panning');
+  }});
+
+  viewer.addEventListener('pointercancel', function(e) {{
+    drag.active = false;
+    viewer.classList.remove('panning');
+  }});
+
+  /* ── Page navigation ───────────────────────────────── */
   function showPage(n) {{
     cur = Math.max(0, Math.min(n, PAGES.length - 1));
     img.src = 'data:image/png;base64,' + PAGES[cur];
     info.textContent = 'Page ' + (cur + 1) + ' / ' + PAGES.length;
     prevBtn.disabled = (cur === 0);
     nextBtn.disabled = (cur === PAGES.length - 1);
-    sendHeight();
-  }}
-
-  function sendHeight() {{
-    if (document.fullscreenElement || document.webkitFullscreenElement) return;
-    var w = document.documentElement.offsetWidth || 800;
-    var h = Math.round(IMG_H * w / IMG_W) + 56;
-    window.parent.postMessage({{type: 'streamlit:setFrameHeight', height: h}}, '*');
+    viewer.scrollLeft = 0; viewer.scrollTop = 0;
+    applyZoom();
   }}
 
   prevBtn.addEventListener('click', function() {{ showPage(cur - 1); }});
   nextBtn.addEventListener('click', function() {{ showPage(cur + 1); }});
 
-  /* Keyboard: arrows navigate pages; other keys stay protected */
+  /* Keyboard */
   document.addEventListener('keydown', function(e) {{
-    if (e.key === 'ArrowRight' || e.key === 'ArrowDown')  {{ showPage(cur + 1); return; }}
-    if (e.key === 'ArrowLeft'  || e.key === 'ArrowUp')    {{ showPage(cur - 1); return; }}
-    var ctrl = e.ctrlKey || e.metaKey, shift = e.shiftKey;
+    var ctrl = e.ctrlKey || e.metaKey;
+    if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {{ showPage(cur + 1); return; }}
+    if (e.key === 'ArrowLeft'  || e.key === 'ArrowUp')   {{ showPage(cur - 1); return; }}
+    if (ctrl && (e.key === '+' || e.key === '='))  {{ e.preventDefault(); setZoom(zoom + ZOOM_STEP); return; }}
+    if (ctrl && e.key === '-')                     {{ e.preventDefault(); setZoom(zoom - ZOOM_STEP); return; }}
+    if (ctrl && e.key === '0')                     {{ e.preventDefault(); zoom=1; viewer.scrollLeft=0; viewer.scrollTop=0; applyZoom(); return; }}
+    var shift = e.shiftKey;
     if (ctrl && !shift && ['s','S','u','U','a','A','p','P'].includes(e.key)) {{ e.preventDefault(); }}
     if (ctrl && shift  && ['i','I','j','J','c','C'].includes(e.key))         {{ e.preventDefault(); }}
     if (e.key === 'F12') {{ e.preventDefault(); }}
   }});
 
-  /* Fullscreen */
+  /* ── Fullscreen ────────────────────────────────────── */
   function toggleFS() {{
     if (!document.fullscreenElement && !document.webkitFullscreenElement) {{
       (document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen)
@@ -242,114 +378,265 @@ def _render_protected_pdf(pdf_bytes: bytes):
   function onFSChange() {{
     var inFS = !!(document.fullscreenElement || document.webkitFullscreenElement);
     fsBtn.innerHTML = inFS ? '&#x2715; Exit Full Screen' : '&#x26F6; Full Screen';
-    if (!inFS) setTimeout(sendHeight, 100);
+    if (!inFS) {{ viewer.style.height = ''; setTimeout(sendHeight, 100); }}
   }}
   document.addEventListener('fullscreenchange', onFSChange);
   document.addEventListener('webkitfullscreenchange', onFSChange);
+
+  /* Give the iframe focus when hovered so mouse-wheel scroll works immediately */
+  viewer.addEventListener('mouseover', function() {{ window.focus(); }}, {{passive: true}});
 
   /* Copy protection */
   document.addEventListener('contextmenu', function(e) {{ e.preventDefault(); }}, true);
   document.addEventListener('dragstart',   function(e) {{ e.preventDefault(); }});
 
   showPage(0);
-  window.addEventListener('resize', function() {{ setTimeout(sendHeight, 50); }});
+  window.addEventListener('resize', function() {{ setTimeout(applyZoom, 50); }});
 </script>
 """
     init_h = int(img_h / img_w * 1200) + 70
     components.html(protected_html, height=init_h)
 
 
-def public_protected_viewer():
-    """View-only protected PDF viewer — no login required."""
-    st.subheader("🔑 View Protected Document")
-
-    # Load admin-configured shared folder and whitelist
-    shared_folder = db.get_setting("__system__", "shared_viewer_folder", "") or ""
-    try:
-        visible_files: list[str] = json.loads(
-            db.get_setting("__system__", "shared_viewer_files", "[]") or "[]"
-        )
-    except (json.JSONDecodeError, TypeError):
-        visible_files = []
-
-    shared_pdfs: list[str] = []
-    if shared_folder and os.path.isdir(shared_folder) and visible_files:
-        # Only show files that exist on disk AND are in the admin whitelist
-        shared_pdfs = sorted(
-            f for f in visible_files
-            if f.lower().endswith(".pdf") and os.path.isfile(os.path.join(shared_folder, f))
-        )
-
-    # Mode toggle: show "Select" option only when folder is configured and has files
-    if shared_pdfs:
-        mode = st.radio(
-            "Source",
-            ["📂 Select from shared folder", "📤 Upload file"],
-            horizontal=True,
-            key="pub_view_mode",
-        )
-    else:
-        mode = "📤 Upload file"
-
+def _browse_and_view_pdfs(folder_options: dict, key_prefix: str):
+    """Folder → document picker + 'Show' gate + viewer, shared by the public and
+    department-scoped SOP viewers. folder_options is {label: absolute_dir_path}."""
     pdf_bytes: bytes | None = None
+    selected = None
+    folder_label = None
 
-    if mode == "📂 Select from shared folder":
-        selected = st.selectbox("Select a document", shared_pdfs, key="pub_view_select")
-        if selected:
-            try:
-                with open(os.path.join(shared_folder, selected), "rb") as fh:
-                    pdf_bytes = fh.read()
-            except Exception as e:
-                st.error(f"❌ Could not read file: {e}")
-    else:
-        st.caption("Upload a PDF that was locked by this application to view it securely.")
-        locked_file = st.file_uploader(
-            "Upload protected PDF", type="pdf", key="pub_view_upload"
+    col_folder, col_file = st.columns(2)
+    with col_folder:
+        folder_label = st.selectbox(
+            "Folder", list(folder_options.keys()) if folder_options else ["— no folders available —"],
+            disabled=not folder_options, key=f"{key_prefix}_folder"
         )
-        if locked_file:
-            pdf_bytes = locked_file.read()
+    chosen_dir = folder_options.get(folder_label or "", "")
+
+    pdfs: list[str] = []
+    if chosen_dir:
+        try:
+            for root, _dirs, files in os.walk(chosen_dir):
+                for f in files:
+                    if f.lower().endswith(".pdf"):
+                        rel = os.path.relpath(os.path.join(root, f), chosen_dir)
+                        pdfs.append(rel)
+            pdfs = sorted(pdfs)
+        except OSError as e:
+            st.error(f"❌ Could not read folder: {e}")
+
+    with col_file:
+        if pdfs:
+            selected = st.selectbox("Document", pdfs, key=f"{key_prefix}_select")
+        else:
+            selected = None
+            st.selectbox(
+                "Document", ["— no PDFs in this folder —"],
+                disabled=True, key=f"{key_prefix}_select_empty",
+            )
+
+    if selected:
+        try:
+            with open(os.path.join(chosen_dir, selected), "rb") as fh:
+                pdf_bytes = fh.read()
+        except Exception as e:
+            st.error(f"❌ Could not read file: {e}")
 
     if pdf_bytes:
-        _render_protected_pdf(pdf_bytes)
+        _doc_key = f"{folder_label}::{selected}"
+        shown_key = f"_{key_prefix}_shown"
+        shown_key_doc = f"_{key_prefix}_shown_key"
+
+        # Reset "shown" state whenever the user picks a different document
+        if st.session_state.get(shown_key_doc) != _doc_key:
+            st.session_state[shown_key] = False
+            st.session_state[shown_key_doc] = _doc_key
+
+        col_show, _ = st.columns([0.25, 0.75])
+        with col_show:
+            if st.button("👁 Show Document", key=f"{key_prefix}_show_btn", use_container_width=True):
+                st.session_state[shown_key] = True
+
+        if st.session_state.get(shown_key, False):
+            _render_protected_pdf(pdf_bytes)
+
+
+def public_protected_viewer():
+    """View-only PDF viewer for documents meant to be public — no login required.
+
+    Shows only the admin-configured "common" folder (Admin > Shared Viewer). Anything
+    department-specific requires login, because an anonymous visitor has no department
+    to scope against — see sop_viewer_tool() for the authenticated, per-department view.
+    """
+    st.subheader("📄 Public Documents")
+
+    shared_folder = db.get_setting("__system__", "shared_viewer_folder", "") or ""
+    common_name = sop.get_common_folder_name()
+
+    folder_options: dict = {}
+    if shared_folder and common_name:
+        common_path = os.path.join(shared_folder, common_name)
+        if os.path.isdir(common_path):
+            folder_options[f"🌐 {common_name}"] = common_path
+
+    if not folder_options:
+        st.info(
+            "No public documents are configured. Department-specific SOPs require "
+            "logging in — use the **🔐 Login** button above."
+        )
+        return
+
+    _browse_and_view_pdfs(folder_options, key_prefix="pub_view")
+
+
+def sop_viewer_tool():
+    """Authenticated, department-scoped SOP browser: the logged-in user's department
+    folder plus the common folder. Admins see every department folder."""
+    st.header("📋 SOPs")
+
+    shared_folder = db.get_setting("__system__", "shared_viewer_folder", "") or ""
+    if not shared_folder:
+        st.info("No shared SOP folder has been configured yet (Admin ▸ Shared Viewer).")
+        return
+
+    department = st.session_state.get("current_department", "") or ""
+    is_admin = bool(st.session_state.get("is_admin"))
+    folder_options = sop.get_visible_folders(shared_folder, department, is_admin=is_admin)
+
+    if not is_admin and not department:
+        st.warning(
+            "⚠️ Your account has no department on file, so no department folder can "
+            "be shown. Contact an admin to set it (Admin ▸ User Management), or check "
+            "the GLPI roster import."
+        )
+    elif not is_admin and f"📂 {department}" not in folder_options and not any(
+        k.startswith("📂") for k in folder_options
+    ):
+        st.warning(
+            f"⚠️ No SOP folder matches your department (**{department}**). "
+            "An admin can map it explicitly under Admin ▸ SOP Departments."
+        )
+
+    if not folder_options:
+        st.info("No folders available to show.")
+        return
+
+    _browse_and_view_pdfs(folder_options, key_prefix="sop_view")
 
 
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
     st.session_state.current_user = None
     st.session_state.is_admin = False
-    
-    # Auto-login if valid session token is in URL
+    st.session_state.session_token = None
+    st.session_state.current_department = None
+
+    # Auto-login if the URL carries a session token that is still valid and unexpired
     if "session" in st.query_params:
         session_token = st.query_params["session"]
         username = db.get_user_by_session(session_token)
         if username:
             st.session_state.authenticated = True
             st.session_state.current_user = username
+            st.session_state.session_token = session_token
             user_rec = db.get_user_by_username(username)
             if user_rec:
                 st.session_state.is_admin = bool(user_rec['is_admin'])
+                st.session_state.current_department = user_rec['department']
+        else:
+            # Stale/expired/forged token — clear it so it stops being resent.
+            del st.query_params["session"]
+
+def _complete_login(username: str, is_admin: bool, department: str):
+    st.session_state.authenticated = True
+    st.session_state.current_user = username
+    st.session_state.is_admin = is_admin
+    st.session_state.current_department = department or ""
+    # Short-lived token in the query param so the login survives a refresh.
+    token = db.create_session(username)
+    st.session_state.session_token = token
+    st.query_params["session"] = token
 
 def login_screen():
     st.title("🔐 Access Restricted")
     st.write("This application is private. Please log in to continue.")
+    st.caption(
+        "Use your GLPI credentials." if glpi.is_enabled() else
+        "This application is private. Please log in to continue."
+    )
+    if glpi.is_enabled() and glpi.uses_unencrypted_db_connection():
+        st.warning(
+            "⚠️ The GLPI database connection is not using TLS — passwords would "
+            "cross the network unencrypted on their way to that check. Ask an "
+            "admin to enable it (Admin ▸ GLPI)."
+        )
     user = st.text_input("Username")
     pw = st.text_input("Password", type="password")
     col1, col2 = st.columns([0.7, 0.3])
     with col2:
-        if st.button("Login", use_container_width=True):
-            user_record = db.authenticate_user(user, pw)
-            if user_record:
-                st.session_state.authenticated = True
-                st.session_state.current_user = user
-                st.session_state.is_admin = bool(user_record['is_admin'])
-                # Create and save token in query params so it survives refreshes
-                token = db.create_session(user)
-                st.query_params["session"] = token
-                
-                st.success(f"Welcome, {user}! ✅")
-                st.rerun()
-            else:
-                st.error("❌ Incorrect username or password. Access denied.")
+        do_login = st.button("Login", use_container_width=True)
+
+    if not do_login:
+        return
+    if not user or not pw:
+        st.error("❌ Enter both a username and a password.")
+        return
+
+    # GLPI first, when configured: the directory is the source of truth for staff
+    # accounts. A local account (e.g. this app's own 'admin') is tried only if GLPI
+    # is off, or reachable-but-rejects (wrong password stays a rejection, it does not
+    # fall through to a same-named local account).
+    if glpi.is_enabled():
+        try:
+            glpi_user = glpi.authenticate(user, pw)
+        except glpi.GlpiError as e:
+            st.error(f"❌ Could not reach GLPI ({e}). Try again, or ask an admin to check the connection.")
+            return
+
+        if glpi_user is not None:
+            # A username collision between GLPI and a pre-existing LOCAL account here
+            # (e.g. this app's own 'admin' fallback, or any GLPI instance's own
+            # admin-named superuser) is a hard conflict, not a merge — GLPI accepting
+            # a credential for that name is not proof it's the same person. Refuse
+            # rather than let a GLPI login silently assume a local identity.
+            local_conflict = db.get_user_by_username(glpi_user.username)
+            if local_conflict is not None and local_conflict["auth_source"] != db.AUTH_GLPI:
+                st.error(
+                    f"❌ '{glpi_user.username}' is a local account on this app and "
+                    "cannot be used to log in via GLPI. Use its local password instead, "
+                    "or ask an admin to resolve the name conflict."
+                )
+                return
+
+            try:
+                row = db.provision_glpi_user(
+                    glpi_user.username, glpi_user.realname,
+                    glpi_user.department, glpi_user.glpi_id
+                )
+            except db.LocalAccountConflictError:
+                st.error(f"❌ '{glpi_user.username}' is a local account on this app.")
+                return
+
+            _complete_login(row["username"], bool(row["is_admin"]), row["department"])
+            st.success(f"Welcome, {row['username']}! ✅")
+            st.rerun()
+            return
+
+        # GLPI reached and rejected the credential. Only fall back to a local account
+        # if one exists — this keeps 'admin' working without opening a second guess
+        # at every GLPI user's password.
+        local_row = db.get_user_by_username(user)
+        if local_row is None or local_row["auth_source"] == db.AUTH_GLPI:
+            st.error("❌ Incorrect username or password. Access denied.")
+            return
+
+    user_record = db.authenticate_user(user, pw)
+    if user_record:
+        _complete_login(user_record["username"], bool(user_record["is_admin"]), user_record["department"])
+        st.success(f"Welcome, {user}! ✅")
+        st.rerun()
+    else:
+        st.error("❌ Incorrect username or password. Access denied.")
 
 # ── Unauthenticated routing ───────────────────────────────────────────────────
 if not st.session_state.authenticated:
@@ -384,6 +671,7 @@ TAB_PERMISSIONS = [
     ("tab_readonly",         "🔒 Read Only"),
     ("tab_protected_viewer", "🔑 Protected Viewer"),
     ("tab_compare",          "🔎 Compare PDFs"),
+    ("tab_sops",             "📋 SOPs"),
 ]
 BTN_PERMISSIONS = [
     ("btn_apply_stamp",    "Apply Stamp / Watermark"),
@@ -416,6 +704,7 @@ def perm_button(label, perm_key, **kwargs):
 
 # --- Build tabs dynamically based on permissions ---
 _ALL_TAB_DEFS = [
+    ("📋 SOPs",               "tab_sops"),
     ("🪶 Watermark / Stamp", "tab_watermark"),
     ("🔗 Merge PDFs",        "tab_merge"),
     ("✂️ Split PDF",         "tab_split"),
@@ -439,14 +728,7 @@ if st.session_state.is_admin:
 
 tabs = st.tabs(tab_titles)
 
-def get_subdirectories(path: str) -> List[str]:
-    try:
-        p = os.path.normpath(os.path.expanduser(path))
-        if not os.path.isdir(p):
-            return []
-        return [d for d in os.listdir(p) if os.path.isdir(os.path.join(p, d))]
-    except Exception:
-        return []
+# Server-side path safety lives in pathsafe.py (see Admin ▸ Export Paths).
 
 def folder_picker_ui(key_prefix: str, current_path: str):
     """Simple server-side folder picker within Streamlit."""
@@ -478,25 +760,88 @@ def get_page_size_pt(page) -> Tuple[float, float]:
         return h, w
     return w, h
 
+
+@st.cache_data(show_spinner=False, ttl=30)
+def list_system_printers() -> List[str]:
+    """Enumerate printers visible to the SERVER (Windows), including network
+    printers the server has installed/connected. Cached briefly for responsiveness."""
+    try:
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-Printer | Select-Object -ExpandProperty Name"],
+            capture_output=True, text=True, timeout=15,
+        )
+        return [ln.strip() for ln in res.stdout.splitlines() if ln.strip()]
+    except Exception:
+        return []
+
+
+def print_pdf_silent(pdf_bytes: bytes, printer_name: str, sumatra_path: str) -> Tuple[bool, str]:
+    """Send a PDF straight to a printer with no dialog, using SumatraPDF on the server.
+
+    The job comes out at the physical (network) printer — there is no browser dialog
+    and nothing the web user can alter. Returns (ok, message).
+    """
+    if not sumatra_path or not os.path.isfile(sumatra_path):
+        return False, "SumatraPDF path is not configured or not found on the server."
+    if not printer_name:
+        return False, "No printer selected."
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(pdf_bytes)
+            tmp_path = tmp.name
+        # -silent: no UI;  -exit-when-done: block until the job is spooled, then exit
+        res = subprocess.run(
+            [sumatra_path, "-print-to", printer_name, "-silent", "-exit-when-done", tmp_path],
+            capture_output=True, text=True, timeout=120,
+        )
+        if res.returncode != 0:
+            return False, f"SumatraPDF exit {res.returncode}: {(res.stderr or res.stdout or '').strip()}"
+        return True, f"Sent to printer: {printer_name}"
+    except subprocess.TimeoutExpired:
+        return False, "Printing timed out."
+    except Exception as e:
+        return False, str(e)
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+
 def _render_topbar():
     """Render the shared top bar (user info, change password, logout) for all tabs."""
+    is_glpi_user = False
+    user_row = db.get_user_by_username(st.session_state.current_user)
+    if user_row is not None:
+        is_glpi_user = user_row["auth_source"] == db.AUTH_GLPI
+
     col1, col2, col3 = st.columns([0.70, 0.17, 0.13])
     with col1:
-        st.caption(f"👋 Logged in as: **{st.session_state.current_user}**")
+        dept = st.session_state.get("current_department") or ""
+        dept_suffix = f" · {dept}" if dept else ""
+        st.caption(f"👋 Logged in as: **{st.session_state.current_user}**{dept_suffix}")
     with col2:
-        if st.button("🔑 Change Password", use_container_width=True, key="topbar_chpw_btn"):
-            st.session_state["_show_chpw"] = not st.session_state.get("_show_chpw", False)
-            st.rerun()
+        if not is_glpi_user:
+            if st.button("🔑 Change Password", use_container_width=True, key="topbar_chpw_btn"):
+                st.session_state["_show_chpw"] = not st.session_state.get("_show_chpw", False)
+                st.rerun()
     with col3:
         if st.button("🚪 Logout", use_container_width=True, key="topbar_logout_btn"):
-            user = st.session_state.current_user
-            if user:
-                db.set_setting(user, "session_token", "")
+            db.destroy_session(st.session_state.get("session_token"))
             st.session_state.authenticated = False
             st.session_state.current_user = None
+            st.session_state.session_token = None
+            st.session_state.is_admin = False
+            st.session_state.current_department = None
             if "session" in st.query_params:
                 del st.query_params["session"]
             st.rerun()
+
+    if is_glpi_user:
+        return  # password is managed in GLPI, nothing to change here
 
     if st.session_state.get("_show_chpw"):
         with st.container(border=True):
@@ -516,9 +861,14 @@ def _render_topbar():
                 elif new_pw != new_pw2:
                     st.error("New passwords do not match.")
                 else:
+                    # Changing the password revokes every session for this user, so
+                    # issue a fresh one to keep the current browser signed in.
                     db.change_password(uname, new_pw)
+                    token = db.create_session(uname)
+                    st.session_state.session_token = token
+                    st.query_params["session"] = token
                     st.session_state["_show_chpw"] = False
-                    st.success("✅ Password changed successfully.")
+                    st.success("✅ Password changed. Other devices have been signed out.")
                     st.rerun()
 
 
@@ -529,7 +879,7 @@ def run_watermark_tool():
     # App config / constants
     # (Page config already set at top level)
     PT_PER_MM = mm
-    PREVIEW_LIMIT = 10  # limit preview pages for performance
+    PREVIEW_LIMIT = 100  # max navigable preview pages (pages render on demand)
 
     # ─────────────────────────────────────────────────────────────────────────────
     # Utility functions
@@ -616,6 +966,17 @@ def run_watermark_tool():
     if "sec_show_user" not in ss: ss.sec_show_user = False
     if "sec_show_owner" not in ss: ss.sec_show_owner = False
 
+    def _build_signature_text(when: Optional[datetime.datetime] = None) -> str:
+        """One-line digital-signature text from the stored action label + username.
+
+        The timestamp is generated fresh each call so it can be finalized at the
+        moment of Apply or Print rather than when the checkbox was first ticked.
+        """
+        action = (ss.get("sig_action_label") or "Digitally signed").strip()
+        user = ss.get("sig_username") or "Unknown User"
+        ts = (when or datetime.datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
+        return f"{action} by {user} — {ts}"
+
     # ─────────────────────────────────────────────────────────────────────────────
     # Template helpers
     def stamps_to_template_dict(stamps: List[Stamp]) -> dict:
@@ -671,7 +1032,11 @@ def run_watermark_tool():
                 st.error("Failed to read PDF (maybe encrypted).")
 
         st.markdown("---")
-        st.header("Add New Stamp")
+        st.header("Add Stamp")
+        st.caption(
+            "Create the stamp here, then set its position, size and style in the "
+            "**Stamp Inspector** on the right."
+        )
 
         prev_auto_sign = ss.get("auto_sign", False)
         ss.auto_sign = st.checkbox("Add digital signature", value=prev_auto_sign)
@@ -679,20 +1044,13 @@ def run_watermark_tool():
         if ss.auto_sign:
             w_mm_page = page_w_pt / mm
 
-            default_w = 60.0
-            default_h = 20.0
-            default_padding = 5.0
-
-            default_x = w_mm_page - default_w - default_padding
+            # Bottom-center, single line: span (almost) the full page width so the
+            # centered one-line text never wraps; the box itself is invisible by default.
+            default_padding = 8.0
+            default_h = 10.0
+            default_w = max(40.0, w_mm_page - 2 * default_padding)
+            default_x = (w_mm_page - default_w) / 2.0
             default_y = default_padding
-
-            use_default_pos = st.checkbox("Use default position (bottom-right corner)", True)
-
-            if not use_default_pos:
-                default_x = st.number_input("X (mm)", 0.0, 5000.0, default_x)
-                default_y = st.number_input("Y (mm)", 0.0, 5000.0, default_y)
-                default_w = st.number_input("Width (mm)", 5.0, 5000.0, default_w)
-                default_h = st.number_input("Height (mm)", 5.0, 5000.0, default_h)
 
             username = st.session_state.current_user or "Unknown User"
             db_sig_action = db.get_setting(username, "default_sig_action", "Digitally signed")
@@ -701,14 +1059,19 @@ def run_watermark_tool():
             if sig_action_val != db_sig_action:
                 db.set_setting(username, "default_sig_action", sig_action_val)
 
-            sig_opacity = st.slider("Box Fill Transparency", 0.0, 1.0, 0.0, 0.05, key="sig_fill_opacity")
-            sig_border_opacity = st.slider("Box Border Transparency", 0.0, 1.0, 0.0, 0.05, key="sig_border_opacity")
+            # Remember the parts so the timestamp can be (re)generated at Apply / Print time
+            ss["sig_action_label"] = sig_action_val
+            ss["sig_username"] = username
 
-            # When checkbox is first checked, record the timestamp and add the stamp
+            st.caption(
+                "Placed bottom-center, borderless with no box. Reposition or restyle it "
+                "in the Stamp Inspector."
+            )
+
+            # When checkbox is first checked, add the stamp. The timestamp shown here is a
+            # preview — it is finalized to the real moment on Apply or Print.
             if not prev_auto_sign:
-                ss["sig_sign_time"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 if sig_action_val.strip():
-                    final_sig_text = f"{sig_action_val.strip()} by {username}\nDate: {ss['sig_sign_time']}"
                     ss.stamps.append(
                         Stamp(
                             stamp_type="text",
@@ -719,15 +1082,15 @@ def run_watermark_tool():
                             rotation_deg=0,
                             page_from=1,
                             page_to=max(1, num_pages) if num_pages else 1,
-                            text=final_sig_text,
+                            text=_build_signature_text(),
                             font_size_pt=10,
                             bold=False,
                             italic=False,
                             rect_fill_hex="#FFFFFF",
                             rect_border_hex="#000000",
                             text_color_hex="#000000",
-                            rect_opacity=sig_opacity,
-                            rect_border_opacity=sig_border_opacity,
+                            rect_opacity=1.0,          # fully transparent box
+                            rect_border_opacity=1.0,   # fully transparent border
                             border_width_pt=0.5,
                             padding_mm=2.0,
                             tiled=False
@@ -744,86 +1107,49 @@ def run_watermark_tool():
                 ss.stamps.pop(sig_idx)
             ss.pop("sig_stamp_idx", None)
             ss.pop("sig_sign_time", None)
+            ss.pop("sig_action_label", None)
+            ss.pop("sig_username", None)
             st.rerun()
 
 
+        # Creation only. Every stamp property is edited in the Stamp Inspector on the
+        # right, so nothing here duplicates a control that exists there.
         new_type = st.radio("Type", ["image", "text"], horizontal=True)
-        nx = st.number_input("X (mm)", 0.0, 5000.0, 50.0)
-        ny = st.number_input("Y (mm)", 0.0, 5000.0, 50.0)
-        nw = st.number_input("Width (mm)", 5.0, 5000.0, 50.0)
-        nh = st.number_input("Height (mm)", 5.0, 5000.0, 30.0)
-        nrot = st.slider("Rotation (°)", -180.0, 180.0, 0.0)
 
         n_img = None
-        n_text = ""
-        n_font = 28
-        n_bold = True
-        n_italic = False
-        n_fill = "#FFFFFF"
-        n_border = "#000000"
-        n_text_col = "#000000"
-        n_opacity = 0.0
-        n_border_opacity = 0.0
-        n_bw = 1.0
-        n_pad = 3.0
-        n_tiled = False
-        n_tile_dx_mm = 60.0
-        n_tile_dy_mm = 60.0
-        n_tile_angle = 45.0
-
         if new_type == "image":
             up = st.file_uploader("Image (PNG/JPG)", type=["png", "jpg", "jpeg"], key="new_img")
             if up:
                 n_img = compress_image(up.read())
-        else:
-            n_text = st.text_input("Text", "CONTROL COPY")
-            c1, c2, c3 = st.columns(3)
-            with c1: n_bold = st.checkbox("Bold", True)
-            with c2: n_italic = st.checkbox("Italic", False)
-            with c3: n_font = st.number_input("Font size (pt)", 8, 200, 28)
-        
-        st.subheader("Box & Style")
-        c4, c5 = st.columns(2)
-        with c4:
-            n_fill = st.color_picker("Rect fill", "#FFFFFF")
-            n_opacity = st.slider("Rect fill transparency (0→1)", 0.0, 1.0, 0.0, 0.05)
-        with c5:
-            n_border = st.color_picker("Rect border", "#000000")
-            n_border_opacity = st.slider("Rect border transparency (0→1)", 0.0, 1.0, 0.0, 0.05)
-            n_bw = st.number_input("Border width (pt)", 0.0, 12.0, 1.0, 0.5)
-        n_text_col = st.color_picker("Text color", "#000000")
-        n_pad = st.number_input("Padding (mm)", 0.0, 50.0, 3.0, 0.5)
 
-        if new_type == "text":
-            with st.expander("Tiled watermark (text only)"):
-                n_tiled = st.checkbox("Enable tiled mode", False)
-                n_tile_dx_mm = st.number_input("Tile spacing X (mm)", 10.0, 500.0, 120.0, 1.0)
-                n_tile_dy_mm = st.number_input("Tile spacing Y (mm)", 10.0, 500.0, 120.0, 1.0)
-                n_tile_angle = st.slider("Tile angle (°)", -180.0, 180.0, 45.0)
-
-        if st.button("➕ Add stamp"):
+        if st.button("➕ Add stamp", use_container_width=True):
             if new_type == "image" and not n_img:
                 st.warning("Please upload an image.")
             else:
                 pf, pt = 1, max(1, num_pages) if num_pages else 1
+                # Starting values match what the old creation form defaulted to, so a
+                # freshly added stamp looks exactly as it did before.
                 ss.stamps.append(
                     Stamp(
                         stamp_type=new_type,
-                        x_mm=nx, y_mm=ny, w_mm=nw, h_mm=nh, rotation_deg=nrot,
+                        x_mm=50.0, y_mm=50.0, w_mm=50.0, h_mm=30.0, rotation_deg=0.0,
                         page_from=pf, page_to=pt,
                         image_bytes=n_img,
-                        text=n_text, font_size_pt=n_font, bold=n_bold, italic=n_italic,
-                        rect_fill_hex=n_fill, rect_border_hex=n_border, text_color_hex=n_text_col,
-                        rect_opacity=n_opacity,
-                        rect_border_opacity=n_border_opacity,
-                        border_width_pt=n_bw,
-                        padding_mm=n_pad,
-                        tiled=(n_tiled if new_type == "text" else False),
-                        tile_dx_mm=n_tile_dx_mm, tile_dy_mm=n_tile_dy_mm, tile_angle_deg=n_tile_angle
+                        text=("CONTROL COPY" if new_type == "text" else ""),
+                        font_size_pt=28, bold=True, italic=False,
+                        rect_fill_hex="#FFFFFF", rect_border_hex="#000000",
+                        text_color_hex="#000000",
+                        rect_opacity=0.0,
+                        rect_border_opacity=0.0,
+                        border_width_pt=0.0,
+                        padding_mm=3.0,
+                        tiled=False,
+                        tile_dx_mm=120.0, tile_dy_mm=120.0, tile_angle_deg=45.0,
                     )
                 )
                 ss.selected_stamp_index = len(ss.stamps) - 1
-                st.success("Stamp added — edit it in the right panel.")
+                ss.preview_update_requested = True
+                st.rerun()
 
     # ─────────────────────────────────────────────────────────────────────────────
     # Template Save/Load
@@ -863,34 +1189,50 @@ def run_watermark_tool():
 
     # ─────────────────────────────────────────────────────────────────────────────
     # Cached rendering & helpers
+    # Preview rendering is lazy: only the page actually on screen is rasterized.
+    # Rendering the whole range up front costs ~5 MB of RAM per A4 page at scale 1.8,
+    # which does not scale to PREVIEW_LIMIT pages across concurrent users.
+
     @st.cache_data(show_spinner=False)
-    def render_pdf_pages_to_images(pdf_bytes: bytes, scale: float, limit: int) -> Tuple[List[Image.Image], Tuple[float,float]]:
+    def get_pdf_preview_info(pdf_bytes: bytes, limit: int) -> Tuple[int, int, Tuple[float, float]]:
+        """Return (previewable_pages, total_pages, first_page_size_pt) without rasterizing."""
         try:
             pdf = pdfium.PdfDocument(io.BytesIO(_strip_cropbox(pdf_bytes)))
         except Exception:
-            return [], (595.276, 841.89)
+            return 0, 0, (595.276, 841.89)
 
-        n = len(pdf)
-        pages = min(n, limit)
+        total = len(pdf)
+        pages = min(total, limit)
         if pages <= 0:
             pdf.close()
-            return [], (595.276, 841.89)
+            return 0, total, (595.276, 841.89)
 
         # For preview size, we use the first page (consistent with the rest of the UI)
         first = pdf.get_page(0)
         # pdfium handles rotation automatically in rendered dimensions
         page_w_pt, page_h_pt = first.get_size()
         first.close()
-
-        images = []
-        for i in range(pages):
-            pg = pdf.get_page(i)
-            img = pg.render(scale=scale).to_pil()
-            pg.close()
-            images.append(img)
-
         pdf.close()
-        return images, (page_w_pt, page_h_pt)
+        return pages, total, (page_w_pt, page_h_pt)
+
+    @st.cache_data(show_spinner=False, max_entries=24)
+    def render_pdf_page_to_image(pdf_bytes: bytes, scale: float, page_idx: int) -> Optional[Image.Image]:
+        """Rasterize a single page. Cached per (pdf, scale, page); max_entries bounds
+        the memory a long browsing session can pin."""
+        try:
+            pdf = pdfium.PdfDocument(io.BytesIO(_strip_cropbox(pdf_bytes)))
+        except Exception:
+            return None
+
+        if not (0 <= page_idx < len(pdf)):
+            pdf.close()
+            return None
+
+        pg = pdf.get_page(page_idx)
+        img = pg.render(scale=scale).to_pil()
+        pg.close()
+        pdf.close()
+        return img
 
     def draw_preview_overlay_for_page(
         base_img: Image.Image,
@@ -1052,14 +1394,19 @@ def run_watermark_tool():
             if not is_tiled:
                 fill_alpha = max(0.0, min(1.0, 1.0 - float(sp.rect_opacity or 0.0)))
                 border_alpha = max(0.0, min(1.0, 1.0 - float(sp.rect_border_opacity or 0.0)))
-                
-                if fill_alpha > 0 or border_alpha > 0:
+                # A zero-width PDF line still renders as a 1px hairline, so the border
+                # must be BOTH visible (alpha) AND have a positive width — this matches
+                # the on-screen preview, which only draws a border when width > 0.
+                do_stroke = border_alpha > 0 and float(sp.border_width_pt or 0.0) > 0
+                do_fill = fill_alpha > 0
+
+                if do_stroke or do_fill:
                     can.saveState()
                     ensure_alpha(can, fill_alpha=fill_alpha, stroke_alpha=border_alpha)
                     can.setLineWidth(sp.border_width_pt)
                     can.setStrokeColor(HexColor(sp.rect_border_hex))
                     can.setFillColor(HexColor(sp.rect_fill_hex))
-                    can.rect(0, 0, w_pt, h_pt, stroke=(1 if border_alpha > 0 else 0), fill=(1 if fill_alpha > 0 else 0))
+                    can.rect(0, 0, w_pt, h_pt, stroke=(1 if do_stroke else 0), fill=(1 if do_fill else 0))
                     can.restoreState()
 
             # 3. Draw Content
@@ -1116,11 +1463,12 @@ def run_watermark_tool():
     # MAIN LAYOUT — Preview (left) and Right Control Panel (with Stamp Manager)
     main_col, right_col = st.columns([0.62, 0.38], gap="large")
 
-    # RIGHT CONTROL PANEL — Multi-Stamp Manager + form to edit SELECTED stamp + Security expander + Apply
+    # RIGHT CONTROL PANEL — the single place every stamp property is edited, plus the
+    # stamp list, security expander and Apply.
     with right_col:
-        st.header("Stamp Manager")
+        st.header("🎯 Stamp Inspector")
         if not st.session_state.stamps:
-            st.info("Add a stamp from the left sidebar to edit it here.")
+            st.info("No stamps yet — add one from the **Add Stamp** section in the sidebar.")
             apply_now = False
         else:
             # selection model
@@ -1210,7 +1558,7 @@ def run_watermark_tool():
             # Editor for the SELECTED stamp
             sidx = st.session_state.selected_stamp_index
             editing = st.session_state.stamps[sidx]
-            st.subheader("Edit Selected Stamp (apply on Enter)")
+            st.subheader("Properties")
 
             with st.form(key=f"selected_stamp_editor_{sidx}", clear_on_submit=False):
                 st.caption("Changes apply when you press **Enter** or click **Update Preview**.")
@@ -1241,9 +1589,24 @@ def run_watermark_tool():
                     key=f"rot_{sidx}"
                 )
 
-                if editing.stamp_type == "image":
+                is_text = (editing.stamp_type == "text")
+
+                if not is_text:
                     up2 = st.file_uploader("Replace image (optional)", type=["png", "jpg", "jpeg"], key=f"replace_img_{sidx}")
-                else:
+
+                # Box & border apply to image stamps too — the renderer draws the rect
+                # for both types (see "Draw Box" in build_overlay_for_page).
+                st.subheader("Box & Border")
+                cx4, cx5 = st.columns(2)
+                with cx4:
+                    rect_fill_hex = st.color_picker("Rect fill", value=editing.rect_fill_hex, key=f"fill_{sidx}")
+                    rect_opacity = st.slider("Rect fill transparency (0→1)", 0.0, 1.0, float(editing.rect_opacity), 0.05, key=f"opc_{sidx}")
+                with cx5:
+                    rect_border_hex = st.color_picker("Rect border", value=editing.rect_border_hex, key=f"bor_{sidx}")
+                    rect_border_opacity = st.slider("Rect border transparency (0→1)", 0.0, 1.0, float(editing.rect_border_opacity), 0.05, key=f"bopc_{sidx}")
+                    border_width_pt = st.number_input("Border width (pt)", 0.0, 12.0, float(editing.border_width_pt), 0.5, key=f"bw_{sidx}")
+
+                if is_text:
                     st.subheader("Text & Style")
                     cx1, cx2, cx3 = st.columns(3)
                     with cx1: bold = st.checkbox("Bold", value=editing.bold, key=f"bold_{sidx}")
@@ -1258,15 +1621,6 @@ def run_watermark_tool():
                         disabled=is_sig,
                         help="Digital signature text is read-only." if is_sig else None,
                     )
-
-                    cx4, cx5 = st.columns(2)
-                    with cx4:
-                        rect_fill_hex = st.color_picker("Rect fill", value=editing.rect_fill_hex, key=f"fill_{sidx}")
-                        rect_opacity = st.slider("Rect fill transparency (0→1)", 0.0, 1.0, float(editing.rect_opacity), 0.05, key=f"opc_{sidx}")
-                    with cx5:
-                        rect_border_hex = st.color_picker("Rect border", value=editing.rect_border_hex, key=f"bor_{sidx}")
-                        rect_border_opacity = st.slider("Rect border transparency (0→1)", 0.0, 1.0, float(editing.rect_border_opacity), 0.05, key=f"bopc_{sidx}")
-                        border_width_pt = st.number_input("Border width (pt)", 0.0, 12.0, float(editing.border_width_pt), 0.5, key=f"bw_{sidx}")
 
                     text_color_hex = st.color_picker("Text color", value=editing.text_color_hex, key=f"txtc_{sidx}")
                     padding_mm = st.number_input("Padding (mm)", 0.0, 50.0, editing.padding_mm, 0.5, key=f"pad_{sidx}")
@@ -1288,16 +1642,20 @@ def run_watermark_tool():
                 editing.page_to = page_to
                 editing.x_mm = x_mm; editing.y_mm = y_mm; editing.w_mm = w_mm; editing.h_mm = h_mm
                 editing.rotation_deg = rotation
-                if editing.stamp_type == "image":
-                    if 'up2' in locals() and up2 is not None:
+
+                # Shared box properties (both stamp types)
+                editing.rect_fill_hex = rect_fill_hex
+                editing.rect_opacity = rect_opacity
+                editing.rect_border_hex = rect_border_hex
+                editing.rect_border_opacity = rect_border_opacity
+                editing.border_width_pt = border_width_pt
+
+                if not is_text:
+                    if up2 is not None:
                         editing.image_bytes = up2.read()
                 else:
                     editing.bold = bold; editing.italic = italic; editing.font_size_pt = font_size_pt
                     editing.text = text_val
-                    editing.rect_fill_hex = rect_fill_hex
-                    editing.rect_opacity = rect_opacity
-                    editing.rect_border_hex = rect_border_hex
-                    editing.border_width_pt = border_width_pt
                     editing.text_color_hex = text_color_hex
                     editing.padding_mm = padding_mm
                     editing.tiled = last_tiled
@@ -1411,6 +1769,24 @@ def run_watermark_tool():
         btn_label = "🚀 Apply Changes (Stamps / Security / Export)" if ss.stamps else "🚀 Apply Settings (Security / Export)"
         apply_now = perm_button(btn_label, "btn_apply_stamp", use_container_width=True, key="apply_btn")
 
+        # Print — signs with the print moment, then sends the PDF straight to a network
+        # printer on the SERVER with no dialog (SumatraPDF). Stamps only (no encryption).
+        _printers = list_system_printers()
+        if _printers:
+            ss.print_target = st.selectbox(
+                "Printer", _printers,
+                index=_printers.index(ss.print_target) if ss.get("print_target") in _printers else 0,
+                key="print_target_sel",
+                help="Network printers visible to the server. Configure in Admin → Printing.",
+            )
+        else:
+            ss.print_target = st.text_input(
+                "Printer name / UNC", value=ss.get("print_target", ""), key="print_target_txt",
+                help="No printers detected on the server — type a printer name or \\\\server\\printer.",
+            )
+        print_now = perm_button("🖨️ Print (sign with print time)", "btn_apply_stamp",
+                                 use_container_width=True, key="print_btn")
+
     # LEFT (CENTER) — Preview with spinner on update
     with main_col:
         st.header("Preview (navigate)")
@@ -1423,13 +1799,18 @@ def run_watermark_tool():
                     pass
                 st.session_state.preview_update_requested = False
 
-            base_imgs, (page_w_pt, page_h_pt) = render_pdf_pages_to_images(
-                st.session_state.pdf_bytes, render_scale, PREVIEW_LIMIT
+            total_preview_pages, doc_total_pages, (page_w_pt, page_h_pt) = get_pdf_preview_info(
+                st.session_state.pdf_bytes, PREVIEW_LIMIT
             )
-            total_preview_pages = len(base_imgs)
             if total_preview_pages == 0:
                 st.error("Unable to load PDF for preview. It may be encrypted or corrupted.")
             else:
+                # Clamp before the slider: a newly uploaded, shorter PDF can leave a
+                # stale index behind, which is outside the slider's range.
+                st.session_state.preview_page_index = min(
+                    max(st.session_state.preview_page_index, 0), total_preview_pages - 1
+                )
+
                 nav1, nav2, nav3 = st.columns([0.2, 0.6, 0.2])
                 with nav1:
                     if st.button("◀ Prev", use_container_width=True) and st.session_state.preview_page_index > 0:
@@ -1457,10 +1838,26 @@ def run_watermark_tool():
                         st.rerun()
 
                 idx = st.session_state.preview_page_index
-                preview = draw_preview_overlay_for_page(
-                    base_imgs[idx], idx, st.session_state.stamps, page_w_pt, page_h_pt
-                )
-                st.image(preview, caption=f"Preview page {idx+1}/{total_preview_pages} (updates when you press 'Update Preview')")
+
+                with st.spinner(f"Rendering page {idx+1}…"):
+                    base_img = render_pdf_page_to_image(
+                        st.session_state.pdf_bytes, render_scale, idx
+                    )
+
+                if base_img is None:
+                    st.error(f"Unable to render page {idx+1}.")
+                else:
+                    preview = draw_preview_overlay_for_page(
+                        base_img, idx, st.session_state.stamps, page_w_pt, page_h_pt
+                    )
+                    st.image(preview, caption=f"Preview page {idx+1}/{total_preview_pages} (updates when you press 'Update Preview')")
+
+                if doc_total_pages > total_preview_pages:
+                    st.caption(
+                        f"ℹ️ Preview is limited to the first {total_preview_pages} of "
+                        f"{doc_total_pages} pages. Stamps still apply to every page in "
+                        "their configured range."
+                    )
 
     # ─────────────────────────────────────────────────────────────────────────────
     # APPLY — merge overlays by page, honoring each stamp's page range + optional encryption
@@ -1468,6 +1865,11 @@ def run_watermark_tool():
         if not st.session_state.pdf_bytes:
             st.error("Please upload a PDF.")
         else:
+            # Finalize the digital signature with the moment of applying settings
+            _sig_idx = ss.get("sig_stamp_idx")
+            if ss.get("auto_sign") and _sig_idx is not None and _sig_idx < len(ss.stamps):
+                ss.stamps[_sig_idx].text = _build_signature_text()
+
             # Validate security inputs if enabled
             if st.session_state.sec_enabled:
                 if not st.session_state.sec_user_pw or not st.session_state.sec_owner_pw:
@@ -1558,13 +1960,10 @@ def run_watermark_tool():
                 def safe_save(p_raw, data, default_name):
                     if not p_raw or not p_raw.strip():
                         return None
-                    
-                    p = os.path.normpath(os.path.expanduser(p_raw.strip()))
-                    
-                    # If it's a directory, append default filename
-                    if os.path.isdir(p):
-                        p = os.path.join(p, default_name)
-                    
+
+                    # Normalizes and enforces the admin export allowlist.
+                    p = resolve_export_path(p_raw, default_name)
+
                     p_dir = os.path.dirname(p)
                     if p_dir and not os.path.exists(p_dir):
                         try:
@@ -1602,6 +2001,82 @@ def run_watermark_tool():
                 st.success("✅ Done! Stamps applied and PDF encrypted.")
             else:
                 st.success("✅ Done! Stamps applied.")
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # PRINT — stamp with the print-time signature and open the browser print dialog.
+    # Stamps only (no encryption) so printing is never blocked by security flags.
+    if print_now:
+        if not st.session_state.pdf_bytes:
+            st.error("Please upload a PDF.")
+        else:
+            with st.spinner("Preparing document for printing..."):
+                _print_bytes = _strip_cropbox(st.session_state.pdf_bytes)
+                reader = PdfReader(io.BytesIO(_print_bytes))
+                num_pg = len(reader.pages)
+                p0_w, _p0_h = get_page_size_pt(reader.pages[0]) if num_pg else (595.276, 841.89)
+                w_mm_page = p0_w / mm
+
+                # Make sure the signature has identity + action even if the checkbox
+                # was never used — Print always signs.
+                _cur_user = st.session_state.get("current_user") or "Unknown User"
+                if not ss.get("sig_username"):
+                    ss["sig_username"] = _cur_user
+                if not ss.get("sig_action_label"):
+                    ss["sig_action_label"] = db.get_setting(_cur_user, "default_sig_action", "Digitally signed")
+
+                # Print ALWAYS applies a digital signature stamped with the print moment.
+                stamps_for_print = list(st.session_state.stamps)
+                _sig_idx = ss.get("sig_stamp_idx")
+                if ss.get("auto_sign") and _sig_idx is not None and _sig_idx < len(stamps_for_print):
+                    # A signature is already configured — just refresh its timestamp.
+                    stamps_for_print[_sig_idx].text = _build_signature_text()
+                else:
+                    # No signature configured — add an automatic bottom-center, one-line one
+                    # (borderless, no box) for this print only.
+                    _pad = 8.0
+                    _sig_w = max(40.0, w_mm_page - 2 * _pad)
+                    stamps_for_print.append(
+                        Stamp(
+                            stamp_type="text",
+                            x_mm=(w_mm_page - _sig_w) / 2.0, y_mm=_pad,
+                            w_mm=_sig_w, h_mm=10.0,
+                            rotation_deg=0, page_from=1, page_to=max(1, num_pg),
+                            text=_build_signature_text(),
+                            font_size_pt=10, bold=False, italic=False,
+                            rect_fill_hex="#FFFFFF", rect_border_hex="#000000",
+                            text_color_hex="#000000",
+                            rect_opacity=1.0, rect_border_opacity=1.0,
+                            border_width_pt=0.5, padding_mm=2.0, tiled=False,
+                        )
+                    )
+
+                writer = PdfWriter()
+                for i, page in enumerate(reader.pages):
+                    curr_w, curr_h = get_page_size_pt(page)
+                    overlay_reader = build_overlay_pdf_for_page(stamps_for_print, i, curr_w, curr_h)
+                    if overlay_reader:
+                        page.merge_page(overlay_reader.pages[0])
+                    writer.add_page(page)
+                out_buf = io.BytesIO()
+                writer.write(out_buf)
+                print_pdf = out_buf.getvalue()
+
+            # Send straight to the selected network printer on the server — no dialog,
+            # nothing the web user can change.
+            sumatra_path = db.get_setting("__system__", "printer_sumatra_path", "") or ""
+            target_printer = ss.get("print_target") or ""
+            ok, msg = print_pdf_silent(print_pdf, target_printer, sumatra_path)
+            if ok:
+                st.success(f"🖨️ Signed with the print time and sent silently to **{target_printer}**.")
+            else:
+                st.error(f"❌ Could not print: {msg}")
+                if "not configured" in msg or "not found" in msg:
+                    st.info("Admin → 🖨️ Printing: set the SumatraPDF path on the server.")
+
+            # Download fallback (e.g. if the printer is offline)
+            fname = st.session_state.get("custom_filename", "stamped_output.pdf")
+            st.download_button("📥 Download stamped PDF (fallback)",
+                               print_pdf, file_name=fname, mime="application/pdf", key="print_dl")
 
     # ─────────────────────────────────────────────────────────────────────────────
     # BATCH WATERMARK — apply current stamps to multiple PDFs at once
@@ -2152,7 +2627,12 @@ def compress_pdf_tool():
 def admin_dashboard_tool():
     st.header("🛡️ Admin Dashboard")
 
-    dash_tab, perm_tab, users_tab, viewer_tab = st.tabs(["👥 Connected Users", "🔑 Permissions", "👤 User Management", "📁 Shared Viewer"])
+    (dash_tab, perm_tab, users_tab, viewer_tab, dept_tab, glpi_tab,
+     print_tab, paths_tab) = st.tabs(
+        ["👥 Connected Users", "🔑 Permissions", "👤 User Management",
+         "📁 Shared Viewer", "🏢 SOP Departments", "🌐 GLPI",
+         "🖨️ Printing", "💾 Export Paths"]
+    )
 
     # ── Connected Users ───────────────────────────────────────────────────────
     with dash_tab:
@@ -2222,8 +2702,22 @@ def admin_dashboard_tool():
         user_data = []
         for u in all_users_mgmt:
             role = "👑 Admin" if u['is_admin'] else "👤 User"
-            user_data.append({"Username": u['username'], "Role": role, "Last Active (UTC)": u['last_seen'] or "—"})
+            source = "🌐 GLPI" if u['auth_source'] == db.AUTH_GLPI else "🔒 Local"
+            active_flag = "" if u['is_active'] else "  ⚠️ inactive"
+            user_data.append({
+                "Username": u['username'],
+                "Role": role,
+                "Source": source,
+                "Department": (u['department'] or "—") + active_flag,
+                "Last Active (UTC)": u['last_seen'] or "—",
+            })
         st.table(user_data)
+        st.caption(
+            "🌐 GLPI accounts authenticate live against GLPI and cannot use a local "
+            "password — reset/toggle-admin apply to 🔒 Local accounts only. Their "
+            "department is refreshed on every login or via a roster import "
+            "(Admin ▸ GLPI)."
+        )
 
         st.markdown("---")
 
@@ -2253,9 +2747,13 @@ def admin_dashboard_tool():
 
         # ── Reset password ────────────────────────────────────────────────────
         with st.expander("🔑 Reset User Password", expanded=False):
-            other_users = [u['username'] for u in all_users_mgmt if u['username'] != current_admin]
+            st.caption("🌐 GLPI accounts are not listed — their password is managed in GLPI.")
+            other_users = [
+                u['username'] for u in all_users_mgmt
+                if u['username'] != current_admin and u['auth_source'] != db.AUTH_GLPI
+            ]
             if not other_users:
-                st.info("No other users to manage.")
+                st.info("No other local users to manage.")
             else:
                 with st.form("reset_pw_form"):
                     reset_target = st.selectbox("Select user", other_users, key="reset_pw_select")
@@ -2302,6 +2800,11 @@ def admin_dashboard_tool():
 
         # ── Delete user ───────────────────────────────────────────────────────
         with st.expander("🗑️ Delete User", expanded=False):
+            st.caption(
+                "Deleting a 🌐 GLPI account only clears its local roster cache and "
+                "permissions — it reappears automatically the next time that person "
+                "logs in or a roster import runs."
+            )
             deletable = [u['username'] for u in all_users_mgmt if u['username'] != current_admin]
             if not deletable:
                 st.info("No other users to delete.")
@@ -2317,10 +2820,15 @@ def admin_dashboard_tool():
     # ── Shared Viewer Folder ──────────────────────────────────────────────────
     with viewer_tab:
         st.subheader("Shared Viewer Folder")
-        st.caption("Choose a folder, then tick the PDFs you want employees to see on the home page.")
+        st.caption(
+            "One subfolder per department. A logged-in user sees only their "
+            "department's subfolder (matched under Admin ▸ SOP Departments) plus the "
+            "common folder below, if set. Admins see every subfolder. Files placed "
+            "directly in the root (not in any subfolder) are not shown to anyone."
+        )
 
         current_shared = db.get_setting("__system__", "shared_viewer_folder", "") or ""
-        new_shared = st.text_input("Folder Path", value=current_shared, key="shared_viewer_folder_input")
+        new_shared = st.text_input("Root Folder Path", value=current_shared, key="shared_viewer_folder_input")
 
         col_save, col_clear = st.columns(2)
         with col_save:
@@ -2331,40 +2839,345 @@ def admin_dashboard_tool():
         with col_clear:
             if st.button("🗑️ Clear Path", use_container_width=True, key="clear_shared_folder"):
                 db.set_setting("__system__", "shared_viewer_folder", "")
-                db.set_setting("__system__", "shared_viewer_files", "[]")
                 st.success("Shared folder cleared.")
                 st.rerun()
 
         st.markdown("---")
+        st.markdown("**Public (no-login) folder**")
+        st.caption(
+            "The folder named here is the only thing shown on the public page before "
+            "login (anonymous visitors have no department to scope by). Leave empty "
+            "to require login for every document."
+        )
+        cur_common = sop.get_common_folder_name()
+        new_common = st.text_input(
+            "Subfolder name (must match a subfolder below exactly)",
+            value=cur_common, key="common_folder_input",
+        )
+        if st.button("💾 Save Public Folder", key="save_common_folder"):
+            sop.set_common_folder_name(new_common)
+            st.success("✅ Public folder saved.")
+            st.rerun()
 
-        # Load current whitelist
-        try:
-            visible_files: list[str] = json.loads(
-                db.get_setting("__system__", "shared_viewer_files", "[]") or "[]"
-            )
-        except (json.JSONDecodeError, TypeError):
-            visible_files = []
+        st.markdown("---")
 
+        # Preview what employees will see: each subfolder, its PDF count, and which
+        # department(s) resolve to it.
         check = new_shared.strip() or current_shared
         if check:
             if os.path.isdir(check):
-                all_pdfs = sorted(f for f in os.listdir(check) if f.lower().endswith(".pdf"))
-                if all_pdfs:
-                    st.markdown(f"**Select which PDFs to show on the home page** ({len(all_pdfs)} found):")
-                    new_visible = []
-                    for fname in all_pdfs:
-                        checked = fname in visible_files
-                        if st.checkbox(fname, value=checked, key=f"vf_{fname}"):
-                            new_visible.append(fname)
+                def _count_pdfs(p: str) -> int:
+                    try:
+                        return sum(
+                            1 for f in os.listdir(p)
+                            if f.lower().endswith(".pdf") and os.path.isfile(os.path.join(p, f))
+                        )
+                    except OSError:
+                        return 0
 
-                    if st.button("💾 Save visible files", use_container_width=True, key="save_visible_files"):
-                        db.set_setting("__system__", "shared_viewer_files", json.dumps(new_visible))
-                        st.success(f"✅ {len(new_visible)} file(s) will be shown on the home page.")
-                        st.rerun()
-                else:
-                    st.info("Folder exists but contains no PDF files yet.")
+                subdirs = sop.list_subfolders(check)
+                root_pdf_count = _count_pdfs(check)
+
+                if root_pdf_count:
+                    st.warning(
+                        f"⚠️ {root_pdf_count} PDF(s) sit directly in the root folder — "
+                        "move them into a department subfolder, they are not shown as-is."
+                    )
+
+                overrides = db.get_dept_folder_map()
+                overrides_by_folder: dict = {}
+                for dept, folder in overrides.items():
+                    overrides_by_folder.setdefault(folder, []).append(dept)
+                all_depts = db.get_all_departments()
+
+                st.markdown("**What employees will see, once logged in:**")
+                if not subdirs:
+                    st.info("Root folder has no subfolders yet.")
+                for d in subdirs:
+                    tags = []
+                    if d == cur_common:
+                        tags.append("🌐 public")
+                    matched_depts = [
+                        dep for dep in all_depts if sop.folder_matches_department(d, dep)
+                    ]
+                    matched_depts += overrides_by_folder.get(d, [])
+                    if matched_depts:
+                        tags.append("department: " + ", ".join(sorted(set(matched_depts))))
+                    tag_str = f"  _( {' · '.join(tags)} )_" if tags else "  _(no department matches this folder)_"
+                    st.markdown(f"- 📂 {d} — {_count_pdfs(os.path.join(check, d))} PDF(s){tag_str}")
             else:
                 st.warning("⚠️ Folder path not found or not accessible.")
+
+    # ── SOP Departments (folder ↔ department overrides) ───────────────────────
+    with dept_tab:
+        st.subheader("Department → Folder Mapping")
+        st.caption(
+            "By default a department folder is matched by name (case/spacing "
+            "insensitive) against the GLPI entity name. Add an override here only "
+            "when a department's folder is named differently."
+        )
+
+        shared_root = db.get_setting("__system__", "shared_viewer_folder", "") or ""
+        subfolders = sop.list_subfolders(shared_root) if shared_root else []
+        known_depts = db.get_all_departments()
+
+        if not shared_root:
+            st.info("Set the Shared Viewer root folder first (previous tab).")
+        elif not subfolders:
+            st.info("The shared root folder has no subfolders yet.")
+        else:
+            unmatched = [
+                dep for dep in known_depts
+                if not any(sop.folder_matches_department(f, dep) for f in subfolders)
+            ]
+            existing_overrides = db.get_dept_folder_map()
+            for dep in unmatched:
+                if dep not in existing_overrides:
+                    st.warning(f"⚠️ No folder matches department **{dep}** — map it below.")
+
+            with st.form("dept_folder_form"):
+                dept_options = sorted(set(known_depts) | set(existing_overrides.keys()))
+                if not dept_options:
+                    st.info("No departments known yet — import the GLPI roster or let users log in once.")
+                    map_dept = st.text_input("Department name (from GLPI)")
+                else:
+                    map_dept = st.selectbox("Department", dept_options, key="dept_map_select")
+                map_folder = st.selectbox("Maps to folder", subfolders, key="dept_map_folder")
+                col_set, col_clear = st.columns(2)
+                with col_set:
+                    set_map = st.form_submit_button("💾 Save Mapping", use_container_width=True)
+                with col_clear:
+                    clear_map = st.form_submit_button("🗑️ Remove Mapping", use_container_width=True)
+
+            if set_map and map_dept:
+                db.set_dept_folder_map(map_dept, map_folder)
+                st.success(f"✅ **{map_dept}** → 📂 {map_folder}")
+                st.rerun()
+            if clear_map and map_dept:
+                db.delete_dept_folder_map(map_dept)
+                st.success(f"Mapping removed for **{map_dept}**.")
+                st.rerun()
+
+            if existing_overrides:
+                st.markdown("---")
+                st.markdown("**Current overrides:**")
+                for dep, folder in sorted(existing_overrides.items()):
+                    st.markdown(f"- **{dep}** → 📂 {folder}")
+
+    # ── GLPI integration ────────────────────────────────────────────────────────
+    with glpi_tab:
+        st.subheader("GLPI Authentication")
+        st.caption(
+            "This checks logins directly against GLPI's own database (read-only) "
+            "instead of GLPI's REST API — no API needs to be enabled in GLPI. "
+            "When on, login checks GLPI first: a correct GLPI username/password logs "
+            "the user in and refreshes their department from GLPI's entity. Local "
+            "accounts (like this one) keep working as a fallback."
+        )
+        st.info(
+            "Needs a **read-only** MySQL/MariaDB account on GLPI's database with "
+            "SELECT on `glpi_users`, `glpi_profiles_users`, and `glpi_entities`. "
+            "Nothing here ever writes to GLPI's database."
+        )
+
+        cfg = glpi.get_config()
+        glpi_enabled = st.checkbox("Enable GLPI login", value=cfg["enabled"], key="glpi_enabled_ck")
+
+        col_host, col_port = st.columns([0.7, 0.3])
+        with col_host:
+            glpi_db_host = st.text_input(
+                "Database host", value=cfg["host"],
+                placeholder="glpi-db.internal", key="glpi_db_host_input",
+            )
+        with col_port:
+            glpi_db_port = st.number_input(
+                "Port", 1, 65535, cfg["port"], key="glpi_db_port_input",
+            )
+        glpi_db_name = st.text_input(
+            "Database name", value=cfg["database"], key="glpi_db_name_input",
+        )
+        col_user, col_pass = st.columns(2)
+        with col_user:
+            glpi_db_user = st.text_input(
+                "DB username (read-only)", value=cfg["user"], key="glpi_db_user_input",
+            )
+        with col_pass:
+            glpi_db_password = st.text_input(
+                "DB password", value=cfg["password"], type="password",
+                key="glpi_db_password_input",
+            )
+        glpi_db_ssl = st.checkbox(
+            "Require TLS for the database connection", value=cfg["ssl"], key="glpi_db_ssl_ck",
+            help="Every login sends a password to this database as part of the "
+                 "check. Leave on unless this connection stays on a network "
+                 "segment you already trust end-to-end.",
+        )
+        if not glpi_db_ssl:
+            st.warning("⚠️ TLS is off — passwords cross the network to this database unencrypted.")
+
+        if st.button("💾 Save GLPI Settings", key="save_glpi_cfg"):
+            glpi.set_config(
+                host=glpi_db_host, port=glpi_db_port, database=glpi_db_name,
+                user=glpi_db_user, password=glpi_db_password,
+                enabled=glpi_enabled, ssl=glpi_db_ssl,
+            )
+            st.success("✅ GLPI settings saved.")
+            st.rerun()
+
+        st.markdown("---")
+        if st.button("🔌 Test Connection", key="test_glpi_btn"):
+            ok, msg = glpi.test_connection()
+            (st.success if ok else st.error)(("✅ " if ok else "❌ ") + msg)
+
+        st.markdown("---")
+        st.subheader("Verify a Department Lookup")
+        st.caption(
+            "Look up one known GLPI username — no password needed — to confirm "
+            "the department this app would resolve for them before rolling out "
+            "to everyone."
+        )
+        lookup_uname = st.text_input("GLPI username to check", key="glpi_lookup_input")
+        if st.button("🔍 Look Up", key="glpi_lookup_btn") and lookup_uname.strip():
+            try:
+                result = glpi.lookup_user(lookup_uname.strip())
+                if result is None:
+                    st.warning(f"No GLPI user named **{lookup_uname}** was found.")
+                else:
+                    st.json(result)
+                    if not result["has_verifiable_password"]:
+                        st.warning(
+                            "⚠️ This account's password is not in a format this app "
+                            "can verify (e.g. LDAP-linked, no local password) — they "
+                            "won't be able to log in here via GLPI."
+                        )
+                    if not result["department"]:
+                        st.warning("⚠️ No department/entity resolved for this user.")
+            except glpi.GlpiError as e:
+                st.error(f"❌ {e}")
+
+        st.markdown("---")
+        st.subheader("Roster Import")
+        st.caption(
+            "Pulls every GLPI user and their entity, and creates/updates the matching "
+            "roster rows here (department + active flag). Passwords are never read "
+            "into this app — GLPI accounts always authenticate live, per login."
+        )
+        if st.button("📥 Import Roster from GLPI", key="import_glpi_roster_btn"):
+            try:
+                with st.spinner("Fetching users from GLPI…"):
+                    rows = glpi.fetch_users()
+                stats = db.sync_glpi_roster(rows)
+                st.success(
+                    f"✅ Imported {len(rows)} GLPI users — "
+                    f"{stats['created']} new, {stats['updated']} updated, "
+                    f"{stats['deactivated']} marked inactive (no longer in GLPI)."
+                )
+                if stats["skipped_local"]:
+                    st.info(
+                        "Skipped (already exist as local accounts, left untouched): "
+                        + ", ".join(stats["skipped_local"])
+                    )
+            except glpi.GlpiError as e:
+                st.error(f"❌ Roster import failed: {e}")
+
+    # ── Printing (silent server-side printing) ────────────────────────────────
+    with print_tab:
+        st.subheader("Silent Printing (server-side)")
+        st.caption(
+            "The 🖨️ Print button in the Stamp tool sends the stamped PDF straight to a "
+            "network printer with no dialog. Printing is done by THIS server using "
+            "SumatraPDF, so the server must (1) have SumatraPDF installed and (2) have the "
+            "network printers installed/connected."
+        )
+
+        cur_sumatra = db.get_setting("__system__", "printer_sumatra_path", "") or ""
+        new_sumatra = st.text_input(
+            "SumatraPDF.exe path (on the server)",
+            value=cur_sumatra,
+            placeholder=r"C:\Program Files\SumatraPDF\SumatraPDF.exe",
+            key="sumatra_path_input",
+        )
+        c_save_s, c_clear_s = st.columns(2)
+        with c_save_s:
+            if st.button("💾 Save", use_container_width=True, key="save_sumatra"):
+                db.set_setting("__system__", "printer_sumatra_path", new_sumatra.strip())
+                st.success("✅ SumatraPDF path saved.")
+                st.rerun()
+        with c_clear_s:
+            if st.button("🗑️ Clear", use_container_width=True, key="clear_sumatra"):
+                db.set_setting("__system__", "printer_sumatra_path", "")
+                st.success("Cleared.")
+                st.rerun()
+
+        check_path = new_sumatra.strip() or cur_sumatra
+        if check_path:
+            if os.path.isfile(check_path):
+                st.success("✅ SumatraPDF found at that path.")
+            else:
+                st.error("❌ No file at that path on the server. Download SumatraPDF and point here.")
+        else:
+            st.info("Not set yet — get the free SumatraPDF from https://www.sumatrapdfreader.org/ "
+                    "and install it on the server.")
+
+        st.markdown("---")
+        st.markdown("**Printers visible to the server:**")
+        printers = list_system_printers()
+        if printers:
+            for p in printers:
+                st.markdown(f"- 🖨️ {p}")
+        else:
+            st.warning("No printers detected on the server (or printer enumeration failed). "
+                       "Install the network printers for the account that runs this app.")
+        if st.button("🔄 Refresh printers", key="refresh_printers"):
+            list_system_printers.clear()
+            st.rerun()
+
+    # ── Export Paths (server-side write allowlist) ────────────────────────────
+    with paths_tab:
+        st.subheader("Allowed Export Folders")
+        st.caption(
+            "Users type destination folders by hand in the Stamp and Read-Only tools. "
+            "List the roots they are permitted to write into — one per line. Anything "
+            "outside these folders is rejected. Leave empty to allow the entire server "
+            "filesystem (not recommended)."
+        )
+
+        cur_roots = db.get_setting("__system__", "export_allowed_roots", "") or ""
+        new_roots = st.text_area(
+            "Allowed roots (one per line)",
+            value=cur_roots,
+            height=140,
+            placeholder="D:\\PDF_Exports\nZ:\\Shared\\Stamped",
+            key="export_roots_input",
+        )
+
+        c_save_r, c_clear_r = st.columns(2)
+        with c_save_r:
+            if st.button("💾 Save", use_container_width=True, key="save_export_roots"):
+                db.set_setting("__system__", "export_allowed_roots", new_roots.strip())
+                st.success("✅ Allowed export folders saved.")
+                st.rerun()
+        with c_clear_r:
+            if st.button("🗑️ Clear (allow all)", use_container_width=True, key="clear_export_roots"):
+                db.set_setting("__system__", "export_allowed_roots", "")
+                st.success("Cleared — all paths are now writable.")
+                st.rerun()
+
+        st.markdown("---")
+        active_roots = get_export_roots()
+        if not active_roots:
+            st.warning(
+                "⚠️ No restriction is active. Any user with the *Save PDF to local path* "
+                "permission can write anywhere the server account can reach. Set at least "
+                "one root above."
+            )
+        else:
+            st.markdown("**Currently enforced:**")
+            for r in active_roots:
+                if os.path.isdir(r):
+                    st.markdown(f"- ✅ `{r}`")
+                else:
+                    st.markdown(f"- ⚠️ `{r}` — does not exist on the server")
 
 
 def readonly_pdf_tool():
@@ -2462,9 +3275,8 @@ There are two conflicting strategies:
 
         # Helper for saving (reuse logic)
         def safe_save_local(p_raw, data, default_name):
-            p = os.path.normpath(os.path.expanduser(p_raw.strip()))
-            if os.path.isdir(p):
-                p = os.path.join(p, default_name)
+            # Normalizes and enforces the admin export allowlist.
+            p = resolve_export_path(p_raw, default_name)
             p_dir = os.path.dirname(p)
             if p_dir and not os.path.exists(p_dir):
                 os.makedirs(p_dir, exist_ok=True)
@@ -3522,6 +4334,7 @@ def pdf_compare_tool():
 
 
 _TAB_FUNC_MAP = {
+    "tab_sops":             sop_viewer_tool,
     "tab_watermark":        run_watermark_tool,
     "tab_merge":            merge_pdf_tool,
     "tab_split":            split_pdf_tool,

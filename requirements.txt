@@ -1,7 +1,9 @@
-streamlit
-pillow
-PyPDF2
-reportlab
-pypdfium2
-pikepdf
-pytesseract
+streamlit==1.58.0
+pillow==12.2.0
+PyPDF2==3.0.1
+reportlab==4.5.1
+pypdfium2==5.9.0
+pikepdf==10.8.0
+pytesseract==0.3.13
+pymysql==2.2.8
+bcrypt==5.0.0
